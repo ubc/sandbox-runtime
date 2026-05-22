@@ -27,20 +27,105 @@ jobs:
           - arch: arm64
             runner: macos-14
             os: macos
+          # Windows legs build and smoke-test the srt-win helper
+          # binary only (TS integration lands in a later PR).
+          - arch: x86-64
+            runner: windows-latest
+            os: windows
+          - arch: arm64
+            runner: windows-11-arm
+            os: windows
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Setup Node.js
+        if: matrix.os != 'windows'
         uses: actions/setup-node@v4
         with:
           node-version: '18'
 
       - name: Setup Bun
+        if: matrix.os != 'windows'
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.1
+
+      # ─── Windows: srt-win helper binary ─────────────────────────────
+      # GitHub-hosted Windows runners run as a member of Administrators
+      # with UAC disabled, so NetLocalGroup* and Fwpm* calls succeed
+      # without an explicit elevation step.
+      - name: Setup Rust (Windows)
+        if: matrix.os == 'windows'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build srt-win (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          cargo build --release --manifest-path vendor/srt-win/Cargo.toml
+          cargo test  --release --manifest-path vendor/srt-win/Cargo.toml
+
+      - name: Smoke-test srt-win group + wfp lifecycle (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "vendor\srt-win\target\release\srt-win.exe"
+          $grp = "srt-ci-test"
+
+          & $exe group create --name $grp
+          if ($LASTEXITCODE -ne 0) { throw "group create failed" }
+
+          $gs = & $exe group status --name $grp | ConvertFrom-Json
+          Write-Host "group status: $($gs | ConvertTo-Json -Compress)"
+          # No logout in CI, so the new group SID is not yet on the
+          # runner's token. `created-not-on-token` is the expected
+          # state here. (`ready` would also be acceptable on a runner
+          # whose image already carries the group, but that's not the
+          # case today.)
+          if ($gs.state -ne 'created-not-on-token' -and $gs.state -ne 'ready') {
+            throw "unexpected group state: $($gs.state)"
+          }
+          if (-not $gs.sid -or -not $gs.sid.StartsWith('S-1-')) {
+            throw "group status did not return a SID"
+          }
+
+          & $exe wfp install --name $grp
+          if ($LASTEXITCODE -ne 0) { throw "wfp install failed" }
+
+          $ws = & $exe wfp status --name $grp | ConvertFrom-Json
+          Write-Host "wfp status: $($ws | ConvertTo-Json -Compress)"
+          if ($ws.state -ne 'installed') {
+            throw "wfp status expected 'installed', got '$($ws.state)'"
+          }
+          if ($ws.filters -lt 6) {
+            throw "expected >=6 filters, got $($ws.filters)"
+          }
+
+          # Idempotency: a second install must succeed and leave the
+          # same number of filters.
+          & $exe wfp install --name $grp
+          if ($LASTEXITCODE -ne 0) { throw "second wfp install failed" }
+          $ws2 = & $exe wfp status --name $grp | ConvertFrom-Json
+          if ($ws2.filters -ne $ws.filters) {
+            throw "idempotency: filter count changed $($ws.filters) -> $($ws2.filters)"
+          }
+
+          & $exe wfp uninstall --all
+          if ($LASTEXITCODE -ne 0) { throw "wfp uninstall failed" }
+          $ws3 = & $exe wfp status --name $grp | ConvertFrom-Json
+          if ($ws3.state -ne 'absent') {
+            throw "post-uninstall state expected 'absent', got '$($ws3.state)'"
+          }
+
+          & $exe group delete --name $grp
+          if ($LASTEXITCODE -ne 0) { throw "group delete failed" }
+          $gs2 = & $exe group status --name $grp | ConvertFrom-Json
+          if ($gs2.state -ne 'absent') {
+            throw "post-delete group state expected 'absent', got '$($gs2.state)'"
+          }
 
       - name: Install system dependencies (Linux)
         if: matrix.os == 'linux'
@@ -68,6 +153,7 @@ jobs:
           brew install ripgrep zsh
 
       - name: Install Node dependencies
+        if: matrix.os != 'windows'
         run: npm install
 
       - name: Build seccomp binaries (Linux)
@@ -75,12 +161,15 @@ jobs:
         run: npm run build:seccomp
 
       - name: Build project
+        if: matrix.os != 'windows'
         run: npm run build
 
       - name: Run tests
+        if: matrix.os != 'windows'
         run: npm test
 
       - name: Run Node.js fallback tests
+        if: matrix.os != 'windows'
         run: node test/utils/which-node-test.mjs
 
       - name: Upload test results
