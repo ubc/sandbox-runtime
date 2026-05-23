@@ -51,7 +51,7 @@ impl Drop for LocalPsid {
     fn drop(&mut self) {
         if !self.0 .0.is_null() {
             unsafe {
-                let _ = LocalFree(HLOCAL(self.0 .0));
+                let _ = LocalFree(Some(HLOCAL(self.0 .0)));
             }
         }
     }
@@ -99,9 +99,9 @@ pub fn sid_account_exists(sid_str: &str) -> Result<SidExistence> {
         let r = LookupAccountSidW(
             windows::core::PCWSTR::null(),
             psid.as_psid(),
-            PWSTR::null(),
+            None,
             &mut cch_name,
-            PWSTR::null(),
+            None,
             &mut cch_dom,
             &mut use_,
         );
@@ -133,9 +133,9 @@ pub fn lookup_account_sid(name: &str) -> Result<String> {
         let _ = LookupAccountNameW(
             windows::core::PCWSTR::null(),
             pcwstr(&name_w),
-            PSID::default(),
+            None,
             &mut cb_sid,
-            PWSTR::null(),
+            None,
             &mut cch_dom,
             &mut use_,
         );
@@ -149,9 +149,9 @@ pub fn lookup_account_sid(name: &str) -> Result<String> {
         LookupAccountNameW(
             windows::core::PCWSTR::null(),
             pcwstr(&name_w),
-            PSID(sid_buf.as_mut_ptr() as *mut c_void),
+            Some(PSID(sid_buf.as_mut_ptr() as *mut c_void)),
             &mut cb_sid,
-            PWSTR(dom_buf.as_mut_ptr()),
+            Some(PWSTR(dom_buf.as_mut_ptr())),
             &mut cch_dom,
             &mut use_,
         )

@@ -37,6 +37,6 @@ pub fn from_pwstr(p: PWSTR) -> String {
 /// `ConvertStringSecurityDescriptorToSecurityDescriptorW`).
 pub fn local_free(p: *mut c_void) {
     unsafe {
-        let _ = LocalFree(HLOCAL(p));
+        let _ = LocalFree(Some(HLOCAL(p)));
     }
 }

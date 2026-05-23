@@ -30,9 +30,10 @@
 #![cfg(windows)]
 
 use std::mem::size_of;
+use windows::core::BOOL;
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ,
-    GENERIC_WRITE, HANDLE,
+    CloseHandle, GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, GENERIC_WRITE,
+    HANDLE,
 };
 use windows::Win32::Security::{
     AccessCheck, CreateRestrictedToken, DuplicateTokenEx, SecurityImpersonation,
@@ -170,9 +171,9 @@ fn check(token: HANDLE, sddl: &str) -> bool {
         )
     };
     unsafe {
-        let _ = windows::Win32::Foundation::LocalFree(
+        let _ = windows::Win32::Foundation::LocalFree(Some(
             windows::Win32::Foundation::HLOCAL(psd.0),
-        );
+        ));
     }
     r.expect("AccessCheck");
     status.as_bool()

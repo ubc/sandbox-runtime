@@ -151,7 +151,7 @@ impl Drop for OwnedSd {
     fn drop(&mut self) {
         if !self.ptr.0.is_null() {
             unsafe {
-                let _ = LocalFree(HLOCAL(self.ptr.0));
+                let _ = LocalFree(Some(HLOCAL(self.ptr.0)));
             }
         }
     }
@@ -506,9 +506,7 @@ fn add_filter(
         size: tag_bytes.len() as u32,
         data: tag_bytes.as_mut_ptr(),
     };
-    let rc = unsafe {
-        FwpmFilterAdd0(engine, &filter, PSECURITY_DESCRIPTOR::default(), None)
-    };
+    let rc = unsafe { FwpmFilterAdd0(engine, &filter, None, None) };
     if rc != 0 && rc != FWP_E_ALREADY_EXISTS {
         return Err(anyhow!("FwpmFilterAdd0({name}): 0x{rc:08x}"));
     }
@@ -582,13 +580,7 @@ pub fn install_filters(sublayer: &GUID, group_sid: &str) -> Result<()> {
             },
             weight: 0x8000,
         };
-        let rc = unsafe {
-            FwpmSubLayerAdd0(
-                engine.h(),
-                &sl,
-                PSECURITY_DESCRIPTOR::default(),
-            )
-        };
+        let rc = unsafe { FwpmSubLayerAdd0(engine.h(), &sl, None) };
         if rc != 0 && rc != FWP_E_ALREADY_EXISTS {
             return Err(anyhow!("FwpmSubLayerAdd0: 0x{rc:08x}"));
         }
@@ -782,8 +774,9 @@ pub fn filter_status(sublayer: &GUID) -> Result<WfpStatus> {
 }
 
 /// Parse a `--sublayer-guid` argument. Accepts braced or unbraced
-/// canonical form. The `windows` crate only offers a panicking
-/// `From<&str>` for `GUID`, so validate the shape ourselves first.
+/// canonical form. `GUID::try_from` only takes the unbraced form and
+/// returns an unhelpful error on failure, so strip braces and
+/// pre-validate the shape for a friendlier message.
 pub fn parse_guid(s: &str) -> Result<GUID> {
     let t = s.trim().trim_start_matches('{').trim_end_matches('}');
     // 8-4-4-4-12 hex with hyphens, exactly 36 chars.
@@ -797,7 +790,7 @@ pub fn parse_guid(s: &str) -> Result<GUID> {
             "invalid GUID '{s}': expected xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
         ));
     }
-    Ok(GUID::from(t))
+    GUID::try_from(t).map_err(|e| anyhow!("invalid GUID '{s}': {e}"))
 }
 
 #[cfg(test)]
