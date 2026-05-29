@@ -322,6 +322,112 @@ describe('Config Validation', () => {
     })
   })
 
+  describe('credentials', () => {
+    const base = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+
+    test('is optional — config without it validates and stays undefined', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse(base)
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.credentials).toBeUndefined()
+      }
+    })
+
+    test('accepts file and env var entries with deny/allow modes', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        credentials: {
+          files: [
+            { path: '~/.netrc', mode: 'deny' },
+            { path: '~/.aws', mode: 'allow' },
+          ],
+          envVars: [
+            { name: 'AWS_SECRET_ACCESS_KEY', mode: 'deny' },
+            { name: 'GH_TOKEN', mode: 'allow' },
+          ],
+        },
+      })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(result.data.credentials?.files).toHaveLength(2)
+        expect(result.data.credentials?.envVars).toHaveLength(2)
+      }
+    })
+
+    test('accepts an empty credentials object', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        credentials: {},
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects mode "mask" for files with an actionable message', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        credentials: {
+          files: [{ path: '~/.config/gh/hosts.yml', mode: 'mask' }],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const messages = result.error.issues.map(i => i.message).join('\n')
+        expect(messages).toContain('not supported yet')
+        expect(messages).toContain('"mask"')
+      }
+    })
+
+    test('rejects mode "mask" for env vars with an actionable message', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        credentials: {
+          envVars: [{ name: 'GH_TOKEN', mode: 'mask' }],
+        },
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        const messages = result.error.issues.map(i => i.message).join('\n')
+        expect(messages).toContain('not supported yet')
+      }
+    })
+
+    test('rejects unknown modes', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        credentials: {
+          files: [{ path: '~/.netrc', mode: 'block' }],
+        },
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('rejects empty file paths', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        credentials: {
+          files: [{ path: '', mode: 'deny' }],
+        },
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test.each(['', 'FOO=BAR', 'FOO BAR'])(
+      'rejects invalid env var name: %j',
+      name => {
+        const result = SandboxRuntimeConfigSchema.safeParse({
+          ...base,
+          credentials: {
+            envVars: [{ name, mode: 'deny' }],
+          },
+        })
+        expect(result.success).toBe(false)
+      },
+    )
+  })
+
   describe('network.tlsTerminate', () => {
     const base = {
       network: { allowedDomains: [], deniedDomains: [] },
