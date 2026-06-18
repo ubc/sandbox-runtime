@@ -46,6 +46,7 @@ import {
   expandGlobPattern,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
+import type { MutateForwardedHeaders } from './request-filter.js'
 import {
   canonicalizeHost,
   isValidHost,
@@ -200,6 +201,29 @@ async function filterNetworkRequest(
  * Returns the socket path if the host matches any MITM domain pattern,
  * otherwise returns undefined.
  */
+/**
+ * Build the header-mutation callback that substitutes sentinel→real for
+ * masked credentials when (and only when) the destination matches
+ * `credentials.injectHosts`. Returns undefined when no injectHosts are
+ * configured — wiring the seam at all is unnecessary then.
+ *
+ * Reads `config` per-call so `updateConfig()` changes to injectHosts are
+ * picked up without restarting the proxy. The returned closure does not
+ * log header values; the registry holds the only copy of the real value.
+ */
+function buildCredentialInjector(): MutateForwardedHeaders | undefined {
+  if (!config?.credentials) return undefined
+  return (headers, destHost) => {
+    if (sentinelRegistry.size === 0) return
+    for (const pattern of config?.credentials?.injectHosts ?? []) {
+      if (matchesDomainPattern(destHost, pattern)) {
+        sentinelRegistry.substituteInHeaders(headers)
+        return
+      }
+    }
+  }
+}
+
 function getMitmSocketPath(host: string): string | undefined {
   if (!config?.network.mitmProxy) {
     return undefined
@@ -282,12 +306,20 @@ async function startHttpProxyServer(
   portRange: readonly [number, number] | undefined,
   excludePorts: ReadonlySet<number>,
 ): Promise<number> {
+  const injectCredentials = buildCredentialInjector()
   httpProxyServer = createHttpProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
     getMitmSocketPath,
     mitmCA,
     filterRequest: config?.network.filterRequest,
+    // TLS-terminated path always gets the injector; the plain-HTTP path
+    // only when explicitly opted in. Without the opt-in, a sentinel sent
+    // over plain HTTP reaches the upstream unchanged (fails closed).
+    mutateHeaders: injectCredentials,
+    mutateHeadersPlaintext: config?.credentials?.allowPlaintextInject
+      ? injectCredentials
+      : undefined,
     parentProxy,
     proxyAuthToken,
   })

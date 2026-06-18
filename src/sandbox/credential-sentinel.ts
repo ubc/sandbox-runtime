@@ -9,6 +9,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import type { IncomingHttpHeaders } from 'node:http'
 
 export const SENTINEL_PREFIX = 'fake_value_'
 
@@ -58,5 +59,40 @@ export class SentinelRegistry {
   clear(): void {
     this.sentinelToReal.clear()
     this.realToSentinel.clear()
+  }
+
+  /**
+   * Replace every registered sentinel found in `headers` with its real
+   * value, in place. Scans all header values rather than a fixed set —
+   * a sentinel showing up anywhere is the substitution trigger, regardless
+   * of header name (Authorization, X-Api-Key, Private-Token, ...).
+   *
+   * The caller is responsible for gating this on transport (TLS-terminated
+   * path only) and destination (`injectHosts`); this function performs the
+   * substitution unconditionally.
+   */
+  substituteInHeaders(headers: IncomingHttpHeaders): void {
+    if (this.sentinelToReal.size === 0) return
+    for (const [name, value] of Object.entries(headers)) {
+      if (value === undefined) continue
+      if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) {
+          value[i] = this.substituteInString(value[i]!)
+        }
+      } else {
+        headers[name] = this.substituteInString(value)
+      }
+    }
+  }
+
+  private substituteInString(s: string): string {
+    // Fast path: the sentinel prefix is fixed, so a header value that
+    // doesn't contain it cannot contain any sentinel.
+    if (!s.includes(SENTINEL_PREFIX)) return s
+    let out = s
+    for (const [sentinel, real] of this.sentinelToReal) {
+      if (out.includes(sentinel)) out = out.split(sentinel).join(real)
+    }
+    return out
   }
 }
