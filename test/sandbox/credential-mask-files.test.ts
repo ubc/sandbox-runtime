@@ -6,6 +6,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -115,7 +116,7 @@ describe('buildMaskedFileBinds', () => {
       store,
     )
     expect(binds).toHaveLength(1)
-    expect(binds[0]!.realPath).toBe(TOKEN_FILE)
+    expect(binds[0]!.realPath).toBe(realpathSync(TOKEN_FILE))
     const fakeContent = readFileSync(binds[0]!.fakePath, 'utf8')
     expect(fakeContent.startsWith(SENTINEL_PREFIX)).toBe(true)
     // The fake holds the sentinel, never the real bytes.
