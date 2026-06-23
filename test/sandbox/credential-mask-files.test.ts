@@ -717,3 +717,185 @@ describe.if(isLinux)('end-to-end file masking via SandboxManager', () => {
     expect(lastHeaders?.authorization).not.toContain(SECRET_CONTENT)
   }, 20000)
 })
+
+/**
+ * End-to-end structured (extract) masking: a multi-credential file is
+ * masked with a regex; inside the sandbox a tool parses the sentinel out
+ * of the preserved structure and sends it as a header; the proxy swaps
+ * each sentinel to its own real captured value at the injectHost.
+ */
+describe.if(isLinux)(
+  'end-to-end structured file masking via SandboxManager',
+  () => {
+    const TEST_DIR = join(tmpdir(), 'srt-credmask-extract-e2e-' + Date.now())
+    const HOST_A = 'localhost'
+    const HOST_B = 'localtest.me'
+
+    // hosts.yml-style: one credential, structure must survive.
+    const YML_FILE = join(TEST_DIR, 'hosts.yml')
+    const YML_TOKEN = 'gho_e2e_real_0123456789abcdef'
+    const YML_CONTENT =
+      'github.com:\n' +
+      '    user: alice\n' +
+      `    oauth_token: ${YML_TOKEN}\n` +
+      '    git_protocol: https\n'
+
+    // .netrc-style: two credentials → two sentinels, each must swap to
+    // its own real value at the proxy.
+    const NETRC_FILE = join(TEST_DIR, 'netrc')
+    const NETRC_TOK_A = 'npm_e2e_real_aaaaaaaa'
+    const NETRC_TOK_B = 'npm_e2e_real_bbbbbbbb'
+    const NETRC_CONTENT =
+      `machine a.example.com login alice password ${NETRC_TOK_A}\n` +
+      `machine b.example.com login bob password ${NETRC_TOK_B}\n`
+
+    let upstream: Server
+    let upstreamPort: number
+    let lastHeaders: IncomingHttpHeaders | undefined
+
+    beforeAll(async () => {
+      mkdirSync(TEST_DIR, { recursive: true })
+      writeFileSync(YML_FILE, YML_CONTENT)
+      writeFileSync(NETRC_FILE, NETRC_CONTENT)
+
+      upstream = createHttpServer((req, res) => {
+        lastHeaders = req.headers
+        res.writeHead(200)
+        res.end('ok')
+      })
+      await new Promise<void>(r => upstream.listen(0, '127.0.0.1', () => r()))
+      upstreamPort = (upstream.address() as AddressInfo).port
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [HOST_A, HOST_B], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+        credentials: {
+          files: [
+            {
+              path: YML_FILE,
+              mode: 'mask',
+              extract: 'oauth_token:\\s*(\\S+)',
+              injectHosts: [HOST_A],
+            },
+            {
+              path: NETRC_FILE,
+              mode: 'mask',
+              extract: 'password\\s+(\\S+)',
+              injectHosts: [HOST_A],
+            },
+          ],
+          allowPlaintextInject: true,
+        },
+      })
+    })
+
+    afterAll(async () => {
+      await SandboxManager.reset()
+      await new Promise<void>(r => upstream.close(() => r()))
+      rmSync(TEST_DIR, { recursive: true, force: true })
+    })
+
+    function runInSandbox(wrappedCommand: string) {
+      return spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+      })
+    }
+
+    async function curlViaManagerProxy(
+      url: string,
+      bearer: string,
+      resolve?: string,
+    ): Promise<number> {
+      const proxyPort = SandboxManager.getProxyPort()!
+      const authToken = SandboxManager.getProxyAuthToken()!
+      const args = [
+        '-sS',
+        '--max-time',
+        '10',
+        '--proxy',
+        `http://srt:${authToken}@127.0.0.1:${proxyPort}`,
+        '-H',
+        `Authorization: Bearer ${bearer}`,
+      ]
+      if (resolve) args.push('--resolve', resolve)
+      args.push(url)
+      const child = spawn('curl', args)
+      child.stdout.on('data', () => {})
+      child.stderr.on('data', () => {})
+      return new Promise(r => child.on('close', code => r(code ?? 1)))
+    }
+
+    test('hosts.yml: parse sentinel from structure → upstream gets real token', async () => {
+      // bwrap leg: extract the oauth_token field from the masked YAML
+      // inside the sandbox — the file parses, and the field value is
+      // the sentinel.
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        `sh -c "grep oauth_token ${YML_FILE} | awk '{print \\$2}'"`,
+      )
+      expect(wrapped).not.toContain(YML_TOKEN)
+      const result = runInSandbox(wrapped)
+      expect(result.status).toBe(0)
+      const sentinel = result.stdout.trim()
+      expect(sentinel.startsWith(SENTINEL_PREFIX)).toBe(true)
+      expect(sentinel).not.toContain(YML_TOKEN)
+
+      // Proxy leg: the sentinel reaches HOST_A as the real token.
+      lastHeaders = undefined
+      const exit = await curlViaManagerProxy(
+        `http://${HOST_A}:${upstreamPort}/`,
+        sentinel,
+      )
+      expect(exit).toBe(0)
+      expect(lastHeaders?.authorization).toBe(`Bearer ${YML_TOKEN}`)
+    }, 20000)
+
+    test('.netrc: two captures → two sentinels, each swaps to its own value', async () => {
+      // bwrap leg: read both password fields inside the sandbox.
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        `sh -c "awk '{print \\$NF}' ${NETRC_FILE}"`,
+      )
+      const result = runInSandbox(wrapped)
+      expect(result.status).toBe(0)
+      const [sA, sB] = result.stdout.trim().split('\n')
+      expect(sA!.startsWith(SENTINEL_PREFIX)).toBe(true)
+      expect(sB!.startsWith(SENTINEL_PREFIX)).toBe(true)
+      expect(sA).not.toBe(sB)
+      expect(result.stdout).not.toContain(NETRC_TOK_A)
+      expect(result.stdout).not.toContain(NETRC_TOK_B)
+
+      // Proxy leg: each sentinel swaps to its own real captured value.
+      lastHeaders = undefined
+      let exit = await curlViaManagerProxy(
+        `http://${HOST_A}:${upstreamPort}/`,
+        sA!,
+      )
+      expect(exit).toBe(0)
+      expect(lastHeaders?.authorization).toBe(`Bearer ${NETRC_TOK_A}`)
+
+      lastHeaders = undefined
+      exit = await curlViaManagerProxy(`http://${HOST_A}:${upstreamPort}/`, sB!)
+      expect(exit).toBe(0)
+      expect(lastHeaders?.authorization).toBe(`Bearer ${NETRC_TOK_B}`)
+    }, 20000)
+
+    test('an extract sentinel does not substitute at a non-injectHost', async () => {
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        `sh -c "grep oauth_token ${YML_FILE} | awk '{print \\$2}'"`,
+      )
+      const sentinel = runInSandbox(wrapped).stdout.trim()
+
+      lastHeaders = undefined
+      const exit = await curlViaManagerProxy(
+        `http://${HOST_B}:${upstreamPort}/`,
+        sentinel,
+        `${HOST_B}:${upstreamPort}:127.0.0.1`,
+      )
+      expect(exit).toBe(0)
+      expect(lastHeaders?.authorization).toBe(`Bearer ${sentinel}`)
+      expect(lastHeaders?.authorization).not.toContain(YML_TOKEN)
+    }, 20000)
+  },
+)
