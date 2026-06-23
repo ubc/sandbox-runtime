@@ -41,9 +41,18 @@ const TOKEN_FILE = join(FIXTURE_DIR, 'gh-token')
 const TOKEN_CONTENT = 'ghp_realsecret_abcdef0123456789'
 const SUBDIR = join(FIXTURE_DIR, 'aws-dir')
 
+const HOSTS_YML = join(FIXTURE_DIR, 'hosts.yml')
+const HOSTS_TOKEN = 'gho_realsecret_zyx9876543210'
+const HOSTS_CONTENT =
+  'github.com:\n' +
+  '    user: alice\n' +
+  `    oauth_token: ${HOSTS_TOKEN}\n` +
+  '    git_protocol: https\n'
+
 beforeAll(() => {
   mkdirSync(SUBDIR, { recursive: true })
   writeFileSync(TOKEN_FILE, TOKEN_CONTENT)
+  writeFileSync(HOSTS_YML, HOSTS_CONTENT)
 })
 
 afterAll(() => {
@@ -277,6 +286,138 @@ describe('buildMaskedFileBinds', () => {
     )
     expect(binds).toHaveLength(0)
     store.dispose()
+  })
+
+  test('extract: fake preserves structure with sentinel substituted in', () => {
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
+      [
+        {
+          path: HOSTS_YML,
+          mode: 'mask',
+          extract: 'oauth_token:\\s*(\\S+)',
+          injectHosts: ['api.github.com'],
+        },
+      ],
+      ['api.github.com'],
+      reg,
+      store,
+    )
+    expect(degradeToDenyPaths).toHaveLength(0)
+    expect(binds).toHaveLength(1)
+    const fake = readFileSync(binds[0]!.fakePath, 'utf8')
+    // Structure preserved byte-for-byte except the token span.
+    expect(fake).toContain('github.com:\n')
+    expect(fake).toContain('    user: alice\n')
+    expect(fake).toContain('    git_protocol: https\n')
+    expect(fake).not.toContain(HOSTS_TOKEN)
+    // The token was replaced by a sentinel registered for #0.
+    const m = fake.match(/oauth_token: (\S+)/)
+    expect(m![1]!.startsWith(SENTINEL_PREFIX)).toBe(true)
+    expect(reg.lookupReal(m![1]!)).toBe(HOSTS_TOKEN)
+    expect(reg.size).toBe(1)
+    store.dispose()
+  })
+
+  test('extract with no match degrades the entry to deny', () => {
+    const reg = new SentinelRegistry()
+    const store = new MaskedFileStore()
+    const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
+      [{ path: HOSTS_YML, mode: 'mask', extract: 'no_such_key: (\\S+)' }],
+      ['api.github.com'],
+      reg,
+      store,
+    )
+    // Fail-closed: no bind is emitted (the real file is NOT exposed),
+    // and the path is reported for the read-deny set.
+    expect(binds).toHaveLength(0)
+    expect(degradeToDenyPaths).toEqual([HOSTS_YML])
+    expect(reg.size).toBe(0)
+    expect(store.dirPath).toBeUndefined()
+    store.dispose()
+  })
+})
+
+/**
+ * Linux integration for structured (extract) masking via SandboxManager:
+ * the bound fake preserves the file's structure with the credential span
+ * replaced by a sentinel.
+ */
+describe.if(isLinux)('structured file masking on Linux (extract)', () => {
+  const TEST_DIR = join(tmpdir(), 'srt-credmask-extract-' + Date.now())
+  const YML_FILE = join(TEST_DIR, 'hosts.yml')
+  const YML_TOKEN = 'gho_struct_real_0123456789abcdef'
+  const YML_CONTENT =
+    'github.com:\n' +
+    '    user: alice\n' +
+    `    oauth_token: ${YML_TOKEN}\n` +
+    '    git_protocol: https\n'
+
+  function runInSandbox(wrappedCommand: string) {
+    return spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+  }
+
+  beforeAll(async () => {
+    mkdirSync(TEST_DIR, { recursive: true })
+    writeFileSync(YML_FILE, YML_CONTENT)
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: { allowedDomains: ['localhost'], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: ['/tmp'], denyWrite: [] },
+      credentials: {
+        files: [
+          {
+            path: YML_FILE,
+            mode: 'mask',
+            extract: 'oauth_token:\\s*(\\S+)',
+          },
+        ],
+        allowPlaintextInject: true,
+      },
+    })
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    rmSync(TEST_DIR, { recursive: true, force: true })
+  })
+
+  test('cat inside the sandbox preserves YAML structure with sentinel', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${YML_FILE}`)
+    expect(wrapped).not.toContain(YML_TOKEN)
+    const result = runInSandbox(wrapped)
+    expect(result.status).toBe(0)
+    const seen = result.stdout
+    // Every non-credential line is byte-identical to the real file.
+    expect(seen).toContain('github.com:\n')
+    expect(seen).toContain('    user: alice\n')
+    expect(seen).toContain('    git_protocol: https\n')
+    // The credential value is gone; a sentinel sits in its place.
+    expect(seen).not.toContain(YML_TOKEN)
+    const m = seen.match(/oauth_token: (\S+)/)
+    expect(m).not.toBeNull()
+    expect(m![1]!.startsWith(SENTINEL_PREFIX)).toBe(true)
+    // Same line count and same length modulo the swapped span — the
+    // rest of the file is untouched.
+    expect(seen.split('\n')).toHaveLength(YML_CONTENT.split('\n').length)
+    // The host-side registry maps that sentinel back to the real token.
+    expect(SandboxManager.getSentinelRegistry().lookupReal(m![1]!)).toBe(
+      YML_TOKEN,
+    )
+  })
+
+  test('the masked file is read-only inside the sandbox', async () => {
+    const wrapped = await SandboxManager.wrapWithSandbox(
+      `sh -c 'echo pwned > ${YML_FILE}'`,
+    )
+    const result = runInSandbox(wrapped)
+    expect(result.status).not.toBe(0)
+    expect(readFileSync(YML_FILE, 'utf8')).toBe(YML_CONTENT)
   })
 })
 
