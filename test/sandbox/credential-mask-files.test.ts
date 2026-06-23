@@ -364,7 +364,7 @@ describe('buildMaskedFileBinds', () => {
     // Fail-closed: no bind is emitted (the real file is NOT exposed),
     // and the path is reported for the read-deny set.
     expect(binds).toHaveLength(0)
-    expect(degradeToDenyPaths).toEqual([HOSTS_YML])
+    expect(degradeToDenyPaths).toEqual([realpathSync(HOSTS_YML)])
     expect(reg.size).toBe(0)
     expect(store.dirPath).toBeUndefined()
     store.dispose()
