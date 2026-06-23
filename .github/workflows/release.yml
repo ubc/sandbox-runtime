@@ -32,9 +32,32 @@ jobs:
           path: vendor/seccomp/${{ matrix.arch }}
           if-no-files-found: error
 
+  build-srt-win:
+    name: Build srt-win (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm run build:srt-win
+      - uses: actions/upload-artifact@v4
+        with:
+          name: srt-win-${{ matrix.arch }}
+          path: vendor/srt-win/${{ matrix.arch }}
+          if-no-files-found: error
+
   publish:
     name: Publish to npm
-    needs: build-seccomp
+    needs: [build-seccomp, build-srt-win]
     runs-on: ubuntu-latest
     environment: npm
     steps:
@@ -73,6 +96,15 @@ jobs:
           name: seccomp-arm64
           path: vendor/seccomp/arm64
       - run: chmod +x vendor/seccomp/*/apply-seccomp
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: srt-win-x64
+          path: vendor/srt-win/x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: srt-win-arm64
+          path: vendor/srt-win/arm64
 
       - run: npm install
       - run: npm run clean && npm run build
