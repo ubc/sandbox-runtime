@@ -1,23 +1,24 @@
 /**
- * Whole-file credential masking (Linux).
+ * Credential file masking (Linux).
  *
  * For a `credentials.files` entry with `mode: "mask"`, srt reads the real
- * file content on the host, registers a sentinel for it in the
- * {@link SentinelRegistry}, and writes the sentinel to a fake file in a
- * manager-owned temp directory. The Linux sandbox then `--ro-bind`s the
- * fake over the real path, so the sandboxed process reads the sentinel.
- * The proxy substitution from env-var masking already scans every header
- * for any registered sentinel, so a tool that does
+ * file content on the host, registers one or more sentinels in the
+ * {@link SentinelRegistry}, and writes a fake file (sentinel-substituted)
+ * to a manager-owned temp directory. The Linux sandbox then `--ro-bind`s
+ * the fake over the real path, so the sandboxed process reads the
+ * sentinel(s). The proxy substitution from env-var masking already scans
+ * every header for any registered sentinel, so a tool that does
  * `Authorization: Bearer $(cat <maskedFile>)` reaches the upstream with
  * the real bytes — no proxy changes required.
  *
+ * Without `extract`, masking is **whole-file**: one sentinel replaces the
+ * entire content. With `extract`, masking is **structured**: a regex picks
+ * out the credential value(s) and only those spans are replaced, so a tool
+ * that parses the file (JSON/YAML/.netrc) still sees valid syntax. See
+ * {@link extractAndSubstitute} and {@link CredentialFileConfigSchema}.
+ *
  * On macOS, SBPL cannot redirect reads, so masked files degrade to
  * `mode: "deny"` (see macos-sandbox-utils.ts).
- *
- * LIMITATION: this is whole-file masking. It works when the file content
- * *is* the credential (a token file). It does not work for structured
- * files a tool parses (JSON/YAML/.netrc) — the tool will fail to parse
- * the sentinel. See {@link CredentialFileConfigSchema}.
  */
 
 import * as fs from 'node:fs'
@@ -34,6 +35,87 @@ import type { SentinelRegistry } from './credential-sentinel.js'
  * with the env var `GH_TOKEN`.
  */
 const FILE_KEY_PREFIX = 'file:'
+
+/**
+ * Placeholder marker for the i-th distinct extracted credential. NUL bytes
+ * are illegal in every text format we expect to mask (.netrc, YAML, JSON,
+ * INI) and never occur in credential values, so a marker can never collide
+ * with real content nor with another capture that happens to contain a
+ * marker-like substring.
+ */
+export function extractPlaceholder(i: number): string {
+  return `\0SRT_EXTRACT_${i}\0`
+}
+
+/**
+ * Result of {@link extractAndSubstitute}: the file content with each
+ * distinct captured credential replaced by `extractPlaceholder(i)`, plus
+ * the captures themselves in placeholder-index order.
+ */
+export interface ExtractResult {
+  fakeContent: string
+  captures: string[]
+}
+
+/**
+ * Apply `pattern` globally to `content`, collect the distinct capture-group-1
+ * values in first-seen order, and return `content` with each occurrence of a
+ * captured value replaced by its index placeholder.
+ *
+ * Returns `null` when the pattern matches nothing — the caller treats that
+ * as fail-closed (degrade to `mode: "deny"`), because a non-matching
+ * pattern is almost certainly a config mistake and binding the unmodified
+ * real file would expose the credential it was meant to mask.
+ *
+ * Throws when a match has no group-1 capture. The schema already rejects
+ * patterns with zero groups, so this only fires when group 1 is optional
+ * and absent for some match (e.g. `"token: (\\S+)?"`); accepting that
+ * would silently mask nothing for that occurrence.
+ *
+ * Pure: no registry, no filesystem, deterministic placeholders — testable
+ * in isolation.
+ */
+export function extractAndSubstitute(
+  content: string,
+  pattern: string,
+): ExtractResult | null {
+  // The schema validates `pattern` compiles; recompiling here with `g` is
+  // what makes matchAll iterate every occurrence.
+  const re = new RegExp(pattern, 'g')
+  const indexByCapture = new Map<string, number>()
+  for (const m of content.matchAll(re)) {
+    const cap = m[1]
+    if (cap === undefined) {
+      throw new Error(
+        `extract pattern /${pattern}/ matched at offset ${m.index} but ` +
+          `capture group 1 is undefined — group 1 must capture the ` +
+          `credential value on every match.`,
+      )
+    }
+    // Empty captures are skipped: replacing the empty string is a no-op
+    // semantically and split('').join(marker) would interleave a marker
+    // between every character.
+    if (cap.length === 0) continue
+    if (!indexByCapture.has(cap)) {
+      indexByCapture.set(cap, indexByCapture.size)
+    }
+  }
+  if (indexByCapture.size === 0) return null
+
+  // Replace longest captures first so a capture that is a substring of
+  // another (rare for tokens, but cheap to guard) cannot corrupt the longer
+  // one's bytes mid-replacement. Placeholders contain NUL, so a later pass
+  // can never re-match inside an already-substituted span.
+  const byLengthDesc = [...indexByCapture.entries()].sort(
+    (a, b) => b[0].length - a[0].length,
+  )
+  let fakeContent = content
+  for (const [cap, i] of byLengthDesc) {
+    fakeContent = fakeContent.split(cap).join(extractPlaceholder(i))
+  }
+  const captures = [...indexByCapture.keys()]
+  return { fakeContent, captures }
+}
 
 /** One masked file's bind mapping for the platform builder. */
 export interface MaskedFileBind {
