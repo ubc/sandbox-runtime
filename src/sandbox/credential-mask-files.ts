@@ -187,26 +187,11 @@ export class MaskedFileStore {
   }
 }
 
-/** Result of {@link buildMaskedFileBinds}. */
-export interface MaskedFileBuildResult {
-  binds: MaskedFileBind[]
-  /**
-   * Resolved paths of `mode: "mask"` entries that degraded to deny at
-   * runtime. Callers union these into the read-deny set.
-   *
-   * Currently always empty — the only runtime-degrade case (`extract`
-   * with no match) now fails open instead. Kept so a future
-   * `onExtractNoMatch: "warn" | "deny" | "error"` option can route to
-   * deny without re-plumbing the consumer in sandbox-manager.ts.
-   */
-  degradeToDenyPaths: string[]
-}
-
 /**
  * For each `mode: "mask"` file entry: resolve the path, read the real
  * content, build the fake content (whole-file or structured per `extract`),
  * register sentinels in `registry`, write the fake via `store`, and return
- * the bind list plus any entries that degraded to deny.
+ * the bind list.
  *
  * Whole-file mode (no `extract`): one sentinel keyed `file:<path>` whose
  * real value is the entire file content; the fake file *is* the sentinel.
@@ -233,9 +218,8 @@ export function buildMaskedFileBinds(
   allowedDomains: readonly string[],
   registry: SentinelRegistry,
   store: MaskedFileStore,
-): MaskedFileBuildResult {
+): MaskedFileBind[] {
   const binds: MaskedFileBind[] = []
-  const degradeToDenyPaths: string[] = []
   for (const f of files) {
     if (f.mode !== 'mask') continue
     const realPath = normalizePathForSandbox(f.path)
@@ -307,7 +291,7 @@ export function buildMaskedFileBinds(
     const fakePath = store.write(key, fakeContent)
     binds.push({ realPath, fakePath })
   }
-  return { binds, degradeToDenyPaths }
+  return binds
 }
 
 export const MASKED_FILE_STORE_PREFIX = 'srt-credmask-'
