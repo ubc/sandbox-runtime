@@ -1,6 +1,16 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  readFileSync,
+  rmSync,
+  renameSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { createServer, type Server } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { isWindows } from '../helpers/platform.js'
@@ -16,6 +26,8 @@ import {
   deleteWindowsGroup,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
+  restoreWindowsAcl,
+  expandWindowsFsDenyPaths,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from '../../src/sandbox/windows-sandbox-utils.js'
 
@@ -231,6 +243,35 @@ async function bindOutOfRange(): Promise<BoundListener> {
   )
 }
 
+// Pure-JS object test — runs on all platforms (the Windows env
+// case-insensitivity bug is in the plain-object scrub, not in any
+// Windows API). SRT_WIN_PATH is pointed at any existing file so
+// getSrtWinPath() doesn't throw on non-Windows hosts.
+describe('wrapCommandWithSandboxWindows env scrub (pure, all platforms)', () => {
+  it('unsetEnvVars scrubs case-insensitively', () => {
+    const prevSrtWin = process.env.SRT_WIN_PATH
+    process.env.SRT_WIN_PATH = process.execPath
+    process.env.test_secret_lower = 'x'
+    try {
+      const { env } = wrapCommandWithSandboxWindows({
+        command: 'echo',
+        group: { groupName: 'g' },
+        unsetEnvVars: ['TEST_SECRET_LOWER'],
+      })
+      // No casing of the name should survive.
+      for (const k of Object.keys(env)) {
+        expect(k.toUpperCase()).not.toBe('TEST_SECRET_LOWER')
+      }
+      expect(env.test_secret_lower).toBeUndefined()
+      expect(env.TEST_SECRET_LOWER).toBeUndefined()
+    } finally {
+      delete process.env.test_secret_lower
+      if (prevSrtWin === undefined) delete process.env.SRT_WIN_PATH
+      else process.env.SRT_WIN_PATH = prevSrtWin
+    }
+  })
+})
+
 describe('parseWindowsBinShell (pure, all platforms)', () => {
   it('maps tokens/paths and rejects the rest', () => {
     expect(parseWindowsBinShell(undefined)).toEqual({ kind: 'cmd' })
@@ -329,7 +370,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   it('initialize() throws with install instructions when group is absent', async () => {
     const cfg = createTestConfig()
     cfg.windows!.groupSid = 'S-1-5-32-9999' // valid form, definitely absent
-    expect(SandboxManager.initialize(cfg)).rejects.toThrow(
+    await expect(SandboxManager.initialize(cfg)).rejects.toThrow(
       /one-time install.*npx sandbox-runtime windows-install/is,
     )
     await SandboxManager.reset()
@@ -461,8 +502,8 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     })
   })
 
-  it('wrapWithSandbox() throws on Windows (use wrapWithSandboxArgv)', () => {
-    expect(SandboxManager.wrapWithSandbox('echo hi')).rejects.toThrow(
+  it('wrapWithSandbox() throws on Windows (use wrapWithSandboxArgv)', async () => {
+    await expect(SandboxManager.wrapWithSandbox('echo hi')).rejects.toThrow(
       /wrapWithSandboxArgv/,
     )
   })
@@ -1016,4 +1057,281 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     // than a network timeout — assert we never see that.
     expect(r.stdout).not.toMatch(/General failure/i)
   }, 20_000)
+})
+
+// ────────────────────────────────────────────────────────────────────
+// Group F — file deny (denyRead/denyWrite via srt-win acl)
+// ────────────────────────────────────────────────────────────────────
+//
+// End-to-end through SandboxManager: initialize() runs `srt-win acl
+// stamp`; wrapWithSandboxArgv() passes `--holder-pid` so exec
+// engages the per-exec dir/file fence; reset() runs `acl restore
+// --json`. The per-Rust-arm cases (A1-A25, H1-H9) are covered by
+// vendor/srt-win-src/ci/smoke-acl.ps1 — these rows prove the TS layer
+// wires correctly on top.
+
+/**
+ * Capture a file's effective DACL via icacls. The leading file
+ * path and the per-ACE `(I)` (INHERITED_ACE) flag are stripped:
+ * `(I)` is OS-managed inheritance metadata — a parent-DACL write
+ * (e.g. `srt-win`'s parent stamp+restore) re-evaluates inheritance
+ * for children and can flip an ACE between explicit and inherited
+ * with no change to who-can-do-what. Same noise class as
+ * SE_DACL_AUTO_INHERITED (which `acl::sd_equiv` already masks).
+ */
+function captureEffectiveDacl(p: string): string {
+  const r = spawnSync('icacls', [p], { encoding: 'utf8', timeout: 5_000 })
+  if (r.status !== 0) {
+    throw new Error(`icacls "${p}" exit ${r.status}: ${r.stderr || r.stdout}`)
+  }
+  return r.stdout
+    .replace(p, '')
+    .replace(/\(I\)/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function createFsTestConfig(
+  fs: Partial<SandboxRuntimeConfig['filesystem']>,
+): SandboxRuntimeConfig {
+  const base = createTestConfig()
+  return { ...base, filesystem: { ...base.filesystem, ...fs } }
+}
+
+describe.if(isWindows)('Windows sandbox: file deny', () => {
+  // One scratch dir per suite under the user's temp; the parent
+  // allow-list stamp lands on this dir. cleanup.ps1 runs `acl
+  // recover --force` after the suite, so a left-over stamp from a
+  // throw mid-test is mopped up.
+  let scratch: string
+  let secret: string // denyRead target
+  let cfg: string // denyWrite target
+
+  beforeAll(async () => {
+    scratch = mkdtempSync(join(tmpdir(), 'srt-fsdeny-'))
+    secret = join(scratch, 'secret.txt')
+    cfg = join(scratch, 'config.txt')
+    writeFileSync(secret, 'TOP-SECRET')
+    writeFileSync(cfg, 'CONFIG-V1')
+    // Glob targets (F6).
+    writeFileSync(join(scratch, 'a.env'), 'ENV-A')
+    writeFileSync(join(scratch, 'b.env'), 'ENV-B')
+    // F4 impostor.
+    writeFileSync(join(scratch, 'impostor.txt'), 'IMPOSTOR')
+
+    // Reuse the network describe's WFP install (already done in CI
+    // by smoke.ps1 or the network suite's beforeAll). If filters
+    // are absent, install them — same shape as the network suite.
+    const wfp = getWindowsWfpStatus({ sublayerGuid: TEST_SUBLAYER })
+    if (wfp.state !== 'installed') {
+      installWindowsSandbox({
+        groupSid: ADMINS_SID,
+        sublayerGuid: TEST_SUBLAYER,
+        proxyPortRange: PORT_RANGE,
+      })
+    }
+
+    await SandboxManager.initialize(
+      createFsTestConfig({ denyRead: [secret], denyWrite: [cfg] }),
+    )
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    // Best-effort scratch cleanup. If a stamp was left behind
+    // (relocated/missing/…), the per-run %LOCALAPPDATA% override in
+    // smoke-acl.ps1 doesn't apply here — but cleanup.ps1 runs
+    // `acl recover --force` after the suite.
+    try {
+      rmSync(scratch, { recursive: true, force: true })
+    } catch {
+      /* left-over stamps can block this; cleanup.ps1 handles it */
+    }
+  })
+
+  it('F1: denyRead — child cannot read the secret', async () => {
+    const r = await runSandboxed(`type "${secret}"`)
+    if (r.stdout.includes('TOP-SECRET')) {
+      throw new Error(
+        `F1: child read the denyRead target — exit=${r.status} ` +
+          `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
+      )
+    }
+    // cmd `type` exits non-zero on access-denied; assert on the
+    // CONTENT (the line above) plus exit≠0, not on the localised
+    // error string.
+    expect(r.status).not.toBe(0)
+  })
+
+  it('F2: denyWrite — child cannot write but CAN read', async () => {
+    const w = await runSandboxed(`echo POISONED>"${cfg}"`)
+    const after = readFileSync(cfg, 'utf8')
+    if (after !== 'CONFIG-V1') {
+      throw new Error(
+        `F2: denyWrite target was modified — content=${JSON.stringify(after)} ` +
+          `exit=${w.status} stderr=${JSON.stringify(w.stderr)}`,
+      )
+    }
+    // denyWrite leaves read open.
+    const r = await runSandboxed(`type "${cfg}"`)
+    expect(r.stdout.trim()).toBe('CONFIG-V1')
+  })
+
+  it('F3: child cannot delete the denyRead target (parent allow-list)', async () => {
+    // cmd `del` exit code is UNRELIABLE on sharing-violation /
+    // access-denied — gate on existence + content, not exit code.
+    await runSandboxed(`del /f /q "${secret}"`)
+    if (!existsSync(secret) || readFileSync(secret, 'utf8') !== 'TOP-SECRET') {
+      throw new Error(`F3: child deleted the denyRead target`)
+    }
+  })
+
+  it('F4: child cannot rename over the denyWrite target', async () => {
+    const impostor = join(scratch, 'impostor.txt')
+    await runSandboxed(`move /y "${impostor}" "${cfg}"`)
+    const after = readFileSync(cfg, 'utf8')
+    if (after !== 'CONFIG-V1') {
+      throw new Error(
+        `F4: rename-over succeeded — content=${JSON.stringify(after)}`,
+      )
+    }
+    // Impostor should still be at its original path.
+    expect(existsSync(impostor)).toBe(true)
+  })
+
+  it('F8: --holder-pid reaches exec (dir-fence diag in stderr)', async () => {
+    const r = await runSandboxed('echo F8')
+    // `srt-win exec --holder-pid` emits `dir fence: N/N dir(s)
+    // fenced` to stderr when it engages. With at least one stamped
+    // file, ≥1 parent dir + the state-DB dir are fenced.
+    if (!/dir fence:\s*\d+\/\d+\s*dir/i.test(r.stderr)) {
+      throw new Error(
+        `F8: no dir-fence diag — --holder-pid not received? ` +
+          `stderr=${JSON.stringify(r.stderr)}`,
+      )
+    }
+  })
+
+  it('F6: glob denyRead — *.env all denied (point-in-time)', async () => {
+    // Re-init with a glob; the existing session must reset first.
+    await SandboxManager.reset()
+    const pattern = join(scratch, '*.env')
+    // Sanity: expansion finds both files and rejects nothing.
+    const expanded = expandWindowsFsDenyPaths([pattern])
+    expect(expanded.sort()).toEqual(
+      [join(scratch, 'a.env'), join(scratch, 'b.env')].sort(),
+    )
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [pattern] }))
+    for (const f of ['a.env', 'b.env']) {
+      const r = await runSandboxed(`type "${join(scratch, f)}"`)
+      if (/ENV-/.test(r.stdout)) {
+        throw new Error(
+          `F6: child read ${f} via glob denyRead — ` +
+            `stdout=${JSON.stringify(r.stdout)}`,
+        )
+      }
+    }
+  }, 30_000)
+
+  // F5 overlaps smoke-acl A9/A11 (the Rust-level DACL round-trip).
+  // Intentional defence-in-depth: those rows pin the srt-win
+  // behaviour; this row pins that SandboxManager calls into it
+  // correctly end-to-end (initialize→stamp, reset→restore).
+  it('F5: reset() restores a target to its pre-stamp effective DACL', async () => {
+    // The F6 session is active; reset it.
+    await SandboxManager.reset()
+    // Fresh subdir + fresh file → its parent has never been
+    // stamp-cycled by an earlier F-row, so the before/stamped/after
+    // capture is isolated from prior parent-restore inheritance
+    // re-evaluation on the suite-shared `scratch`.
+    const sub = mkdtempSync(join(scratch, 'f5-'))
+    const tgt = join(sub, 'f5.txt')
+    writeFileSync(tgt, 'F5')
+    const before = captureEffectiveDacl(tgt)
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [tgt] }))
+    const stamped = captureEffectiveDacl(tgt)
+    expect(stamped).not.toBe(before)
+    await SandboxManager.reset()
+    const after = captureEffectiveDacl(tgt)
+    if (after !== before) {
+      throw new Error(
+        `F5: post-reset effective DACL differs from pre-stamp.\n` +
+          `  before:  ${before}\n` +
+          `  stamped: ${stamped}\n` +
+          `  after:   ${after}`,
+      )
+    }
+  }, 30_000)
+
+  // F7 overlaps smoke-acl A19 (relocated → leftStamped at the
+  // Rust level). Intentional defence-in-depth at the
+  // SandboxManager↔srt-win integration boundary: smoke-acl pins
+  // the Rust behaviour; this row pins that the TS plumbing
+  // surfaces the same outcome.
+  it('F7: relocated file → restore reports relocated, stays stamped', async () => {
+    const reloc = join(scratch, 'reloc.txt')
+    const sub = join(scratch, 'moved')
+    mkdirSync(sub, { recursive: true })
+    writeFileSync(reloc, 'RELOC')
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [reloc] }))
+    // Move from OUTSIDE the sandbox (the host does this; the
+    // protection model says a file moved by the host is no longer
+    // at its recorded path → restore must fail-closed).
+    const movedTo = join(sub, 'reloc.txt')
+    renameSync(reloc, movedTo)
+    // Call restore directly so we can inspect the per-path
+    // outcome (SandboxManager.reset() only logs it). This also
+    // releases the holder, so the reset() below has nothing
+    // left to restore.
+    const out = restoreWindowsAcl({
+      group: { groupSid: ADMINS_SID },
+    })
+    expect(out).toBeDefined()
+    const entry = out!.paths.find(e => e.path.endsWith('reloc.txt'))
+    if (!entry || entry.status !== 'relocated') {
+      throw new Error(
+        `F7: expected status=relocated, got ` + `${JSON.stringify(out!.paths)}`,
+      )
+    }
+    expect(entry.leftStamped).toBe(true)
+    expect(entry.movedTo).toMatch(/reloc\.txt$/i)
+    // The relocated file must still be read-denied (stamp travels
+    // with the inode). Stamp a fresh session so runSandboxed has a
+    // sandbox to run under, then probe.
+    await SandboxManager.reset()
+    await SandboxManager.initialize(createFsTestConfig({}))
+    const r = await runSandboxed(`type "${movedTo}"`)
+    if (r.stdout.includes('RELOC')) {
+      throw new Error(
+        `F7: relocated file is readable after restore — stamp lost`,
+      )
+    }
+    // Cleanup: move it back so a later `acl recover` can clear it.
+    await SandboxManager.reset()
+    renameSync(movedTo, reloc)
+  }, 30_000)
+
+  it('F9: changing fs via reset+initialize takes effect', async () => {
+    const swap1 = join(scratch, 'swap1.txt')
+    const swap2 = join(scratch, 'swap2.txt')
+    writeFileSync(swap1, 'SWAP1')
+    writeFileSync(swap2, 'SWAP2')
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [swap1] }))
+    expect((await runSandboxed(`type "${swap1}"`)).stdout).not.toMatch(/SWAP1/)
+    expect((await runSandboxed(`type "${swap2}"`)).stdout).toMatch(/SWAP2/)
+    // updateConfig with a different denyRead does NOT live-swap
+    // (it warns); reset+initialize is the contract.
+    await SandboxManager.reset()
+    await SandboxManager.initialize(createFsTestConfig({ denyRead: [swap2] }))
+    expect((await runSandboxed(`type "${swap1}"`)).stdout).toMatch(/SWAP1/)
+    expect((await runSandboxed(`type "${swap2}"`)).stdout).not.toMatch(/SWAP2/)
+    await SandboxManager.reset()
+  }, 30_000)
+
+  it('F10: filesystem.allowWrite throws on Windows (deny-only)', async () => {
+    await expect(
+      SandboxManager.initialize(createFsTestConfig({ allowWrite: [scratch] })),
+    ).rejects.toThrow(/allowWrite is not supported on Windows/)
+    await SandboxManager.reset()
+  })
 })
