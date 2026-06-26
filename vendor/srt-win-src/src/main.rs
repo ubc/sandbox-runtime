@@ -80,10 +80,26 @@ enum Cmd {
     ///
     /// Self-elevates via UAC if not already admin. Does NOT
     /// delete the discriminator group — use `srt-win group
-    /// delete --name <N>` for that explicitly.
+    /// delete --name <N>` for that explicitly. **Does** remove
+    /// the sandbox user account, its credential file, and the
+    /// setup marker, unless `--keep-user`.
     Uninstall {
         #[arg(long)]
         sublayer_guid: Option<String>,
+        /// Keep the `srt-sandbox` account, its credential file,
+        /// and the setup marker. Without this flag they are all
+        /// removed (the credential is useless without the
+        /// account and vice versa, so they're treated as one
+        /// unit).
+        #[arg(long)]
+        keep_user: bool,
+    },
+    /// Inspect the sandbox user account that `srt-win install`
+    /// provisions (and that the sandboxed child eventually runs
+    /// as).
+    User {
+        #[command(subcommand)]
+        sub: UserCmd,
     },
     /// Manage the local discriminator group.
     Group {
@@ -198,6 +214,22 @@ struct GroupRef {
     /// lookup may be unreliable.
     #[arg(long)]
     group_sid: Option<String>,
+}
+
+#[derive(Subcommand)]
+enum UserCmd {
+    /// Print the sandbox user's provisioning state as JSON:
+    /// `{user: {exists, sid?, group_exists, group_sid?,
+    /// in_builtin_users, in_sandbox_group, hidden_from_logon},
+    /// cred_present, marker_version?, marker_user_sid?}`.
+    Status,
+    /// Print the sandbox user's decrypted password (and only the
+    /// password) to stdout. The broker uses this for
+    /// `CreateProcessWithLogonW`. Fails when run as the sandbox
+    /// user itself — the state-DB directory carries an explicit
+    /// DENY for `sandbox-runtime-users`, and machine-scope DPAPI
+    /// is **not** a confidentiality boundary without that DENY.
+    ReadCred,
 }
 
 #[derive(Subcommand)]
@@ -682,37 +714,64 @@ fn run() -> anyhow::Result<()> {
                     .with_context(|| format!("invalid --proxy-port-range '{s}'"))?,
                 None => wfp::DEFAULT_PROXY_PORT_RANGE,
             };
-            // Idempotency / conflict pre-check. If filters are
-            // already installed under this sublayer with the SAME
-            // port-range, this is a no-op (exit 0). With a
-            // DIFFERENT range and no --force, refuse (exit 13) so
-            // an unintended config drift surfaces instead of
-            // silently overwriting. A pre-existing install whose
-            // tags lack a port_range (legacy) is treated as
-            // "different" and requires --force.
+            // Idempotency / conflict pre-check. With a DIFFERENT
+            // port-range and no --force, refuse (exit 13) so an
+            // unintended config drift surfaces instead of silently
+            // overwriting. With the SAME range, only return early
+            // when the install is COMPLETE — i.e. the sandbox
+            // user is provisioned, the marker is current, and the
+            // user-SID filter set is present. A pre-separate-user
+            // install (or one that exited 14 after WFP) falls
+            // through and the (idempotent) steps below complete
+            // it. A pre-existing install whose tags lack a
+            // port_range (legacy) is treated as "different" and
+            // requires --force.
             if !force
                 && let Ok(st) = wfp::filter_status(&sl)
                 && st.state == "installed"
             {
                 let want = [range.0, range.1];
                 if st.port_range == Some(want) {
+                    use srt_win::{install, user};
+                    let us = user::status()?;
+                    let mv = install::read_setup()
+                        .ok()
+                        .flatten()
+                        .map(|s| s.marker_version);
+                    if us.exists
+                        && us.in_sandbox_group
+                        && mv == Some(install::SETUP_VERSION)
+                        && st.user_filters > 0
+                    {
+                        eprintln!(
+                            "srt-win: already installed (sublayer={sl:?}, \
+                             port_range={}-{}, filters={}); no changes",
+                            range.0, range.1, st.filters,
+                        );
+                        return Ok(());
+                    }
                     eprintln!(
-                        "srt-win: already installed (sublayer={sl:?}, \
-                         port_range={}-{}, filters={}); no changes",
-                        range.0, range.1, st.filters,
+                        "srt-win: partial install detected \
+                         (user_provisioned={}, marker_version={:?}, \
+                         user_filters={}) — completing",
+                        us.exists, mv, st.user_filters,
                     );
-                    return Ok(());
+                    // Fall through; group/WFP/user steps are all
+                    // idempotent.
                 }
-                let have = st
-                    .port_range
-                    .map(|[l, h]| format!("{l}-{h}"))
-                    .unwrap_or_else(|| "<unknown>".into());
-                eprintln!(
-                    "srt-win: error: already installed under sublayer \
-                     {sl:?} with port_range={have}; pass --force to \
-                     replace, or run `srt-win uninstall` first."
-                );
-                std::process::exit(13);
+                if st.port_range != Some(want) {
+                    let have = st
+                        .port_range
+                        .map(|[l, h]| format!("{l}-{h}"))
+                        .unwrap_or_else(|| "<unknown>".into());
+                    eprintln!(
+                        "srt-win: error: already installed under \
+                         sublayer {sl:?} with port_range={have}; \
+                         pass --force to replace, or run `srt-win \
+                         uninstall` first."
+                    );
+                    std::process::exit(13);
+                }
             }
             // With --group-sid the group is externally managed;
             // just canonicalize. With --name (or the default),
@@ -744,10 +803,42 @@ fn run() -> anyhow::Result<()> {
                 eprintln!("srt-win: error: WFP install: {e:#}");
                 std::process::exit(12);
             }
+            // Sandbox user account + credential file + setup
+            // marker + user-SID-keyed WFP filters. Additive: the
+            // discriminator-group path above is unchanged; both
+            // filter sets coexist in the same sublayer. Failures
+            // here exit 14 so the caller can distinguish "group/
+            // WFP fine, user provisioning failed" from the legacy
+            // 11/12 codes.
+            let user_step = || -> anyhow::Result<srt_win::user::ProvisionedUser> {
+                use srt_win::{install, user};
+                let pu = user::provision()
+                    .context("provision sandbox user")?;
+                install::write_setup(&pu, &gsid).context(
+                    "write sandbox credential + setup marker to state DB",
+                )?;
+                wfp::install_user_filters(&sl, &pu.sid, range)
+                    .context("install user-SID WFP filters")?;
+                Ok(pu)
+            };
+            let pu = match user_step() {
+                Ok(pu) => pu,
+                Err(e) => {
+                    eprintln!("srt-win: error: sandbox user step: {e:#}");
+                    std::process::exit(14);
+                }
+            };
             eprintln!(
                 "srt-win: installed (group={label} sid={gsid}, sublayer={sl:?}, \
-                 proxy_port_range={}-{}, filters=8)",
+                 proxy_port_range={}-{}, filters={}+{})",
                 range.0, range.1,
+                wfp::GROUP_FILTER_COUNT, wfp::USER_FILTER_COUNT,
+            );
+            eprintln!(
+                "srt-win: sandbox user '{}' provisioned (sid={}, \
+                 group={} sid={})",
+                pu.username, pu.sid,
+                srt_win::user::SANDBOX_GROUP, pu.group_sid,
             );
             eprintln!(
                 "srt-win: NOTE — log out and back in before running \
@@ -755,17 +846,49 @@ fn run() -> anyhow::Result<()> {
                  logon; your network is unaffected meanwhile)."
             );
         }
-        Cmd::Uninstall { sublayer_guid } => {
+        Cmd::Uninstall { sublayer_guid, keep_user } => {
             if let Some(code) = maybe_self_elevate()? {
                 std::process::exit(code);
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
             let n = wfp::uninstall_filters(&sl)?;
+            let user_note = if keep_user {
+                "Sandbox user kept (--keep-user)."
+            } else {
+                use srt_win::{install, user};
+                install::clear_setup()
+                    .context("clear credential + setup marker")?;
+                user::deprovision().context("deprovision sandbox user")?;
+                "Sandbox user, credential, and setup marker removed."
+            };
             eprintln!(
                 "srt-win: uninstalled ({n} filter(s) removed). \
                  Group is left intact — run `srt-win group delete` \
-                 to remove it."
+                 to remove it. {user_note}"
             );
+        }
+
+        // ─── user ──────────────────────────────────────────────────
+        Cmd::User { sub: UserCmd::Status } => {
+            use srt_win::{install, user};
+            let st = user::status()?;
+            let setup = install::read_setup().ok().flatten();
+            println!(
+                "{}",
+                json!({
+                    "user": st,
+                    "cred_present": setup.is_some(),
+                    "marker_version": setup.as_ref().map(|s| s.marker_version),
+                    "marker_user_sid": setup.as_ref()
+                        .map(|s| s.sandbox_user_sid.as_str()),
+                })
+            );
+        }
+        Cmd::User { sub: UserCmd::ReadCred } => {
+            let (_, pw) = srt_win::install::read_cred()?;
+            // Password only, no trailing whitespace, so a caller
+            // can capture stdout verbatim.
+            print!("{pw}");
         }
 
         // ─── group ─────────────────────────────────────────────────
