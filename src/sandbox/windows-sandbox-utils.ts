@@ -115,6 +115,13 @@ export interface WindowsSandboxUserStatus {
   credPresent: boolean
   /** Setup marker schema version, when the marker row exists. */
   markerVersion?: number
+  /**
+   * SHA-1 thumbprint of the install-time CA, when one was
+   * installed via `srt-win user trust-ca`. Uppercase hex.
+   */
+  caCertThumb?: string
+  /** PEM-encoded install-time CA certificate, when present. */
+  caCertPem?: string
 }
 
 /**
@@ -245,6 +252,38 @@ export interface WindowsSandboxParams {
   denyRead?: readonly string[]
   /** Per-exec write-deny paths — see {@link denyRead}. */
   denyWrite?: readonly string[]
+  /**
+   * Run the child as the dedicated `srt-sandbox` user via the
+   * two-hop launch (broker → `CreateProcessWithLogonW(runner)` →
+   * runner → restricted-token child). Requires `srt-win install` to
+   * have provisioned the sandbox user. Opt-in — when `false` or
+   * omitted the same-user deny-only-group path is used. The
+   * separate-user path structurally closes the surrogate-spawn
+   * class (schtasks, `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`, BITS,
+   * RunAs="Interactive User" COM): the child's token carries a
+   * different user SID, so it cannot reach real-user processes,
+   * tasks register under `srt-sandbox`, and the user-SID WFP filter
+   * fences `srt-sandbox` egress regardless of how the child was
+   * spawned.
+   */
+  asSandboxUser?: boolean
+  /**
+   * PEM-encoded CA certificate file. Same parameter macOS/Linux
+   * thread to {@link generateProxyEnvVars} for the env-var trust
+   * layer (`NODE_EXTRA_CA_CERTS` etc.). NOT passed to `srt-win
+   * exec` — schannel-level trust under the sandbox user is set
+   * separately via `srt-win user trust-ca` /
+   * {@link windowsTrustCa}; per-exec only sets the env-var layer.
+   *
+   * **Under {@link asSandboxUser}**, this is currently NOT
+   * forwarded to the child: the bundle file lives in the broker's
+   * `%TEMP%`, which the `srt-sandbox` user cannot read, so OpenSSL
+   * clients (msys2 curl, openssl-backed git, node, python) would
+   * fail with `ACCESS_DENIED` on the bundle. The schannel-level
+   * trust set via {@link windowsTrustCa} is the only CA-trust path
+   * for the two-hop launch until working-tree/profile grants land.
+   */
+  caCertPath?: string
   /**
    * Inner shell. Defaults to `{ kind: 'cmd' }`. The child's post-`/c`
    * (or `-Command` / `-c`) content is **passthrough** — `&` chains,
@@ -461,6 +500,8 @@ export function getWindowsSandboxUserStatus(): WindowsSandboxUserStatus {
     }
     cred_present: boolean
     marker_version?: number | null
+    ca_cert_thumb?: string | null
+    ca_cert_pem?: string | null
   }>(['user', 'status'])
   return {
     provisioned: raw.user.exists,
@@ -474,6 +515,64 @@ export function getWindowsSandboxUserStatus(): WindowsSandboxUserStatus {
     ...(typeof raw.marker_version === 'number' && {
       markerVersion: raw.marker_version,
     }),
+    ...(raw.ca_cert_thumb && { caCertThumb: raw.ca_cert_thumb }),
+    ...(raw.ca_cert_pem && { caCertPem: raw.ca_cert_pem }),
+  }
+}
+
+/**
+ * Read back the persistent MITM CA the sandbox was installed with
+ * (via `srt-win user trust-ca` / {@link windowsTrustCa}).
+ * Returns `null` when no CA was installed. The PEM is what `srt-win
+ * user status` reconstructs from the DER stored in `state.db`.
+ *
+ * On Windows with `windows.asSandboxUser`, `tlsTerminate` requires
+ * this CA to be present in the sandbox user's `CurrentUser\Root`
+ * (schannel-level trust is an install-time concern, not
+ * per-session); the host calls this from `initialize()` to fail
+ * early with an actionable message when it isn't.
+ *
+ * @param status pass an already-fetched
+ *   {@link getWindowsSandboxUserStatus} result to avoid a second
+ *   `srt-win user status` spawn.
+ */
+export function getWindowsSandboxCaCert(
+  status?: WindowsSandboxUserStatus,
+): { pem: string; thumb: string } | null {
+  const u = status ?? getWindowsSandboxUserStatus()
+  if (!u.caCertThumb || !u.caCertPem) return null
+  return { pem: u.caCertPem, thumb: u.caCertThumb }
+}
+
+/**
+ * Install (or replace) the MITM CA in the **sandbox user's**
+ * `CurrentUser\Root` and record it in `state.db` (so
+ * {@link getWindowsSandboxCaCert} surfaces its thumbprint + PEM).
+ * Thin wrapper around `srt-win user trust-ca <path>`. Does NOT
+ * require elevation. Persistent until {@link uninstallWindowsSandbox}
+ * deletes the sandbox user's profile.
+ *
+ * The CA has a separate lifecycle from {@link installWindowsSandbox}
+ * — install provisions the account/filters and never touches the CA;
+ * call this AFTER install when `tlsTerminate` will be used with
+ * `windows.asSandboxUser`.
+ *
+ * @throws when the sandbox user is not provisioned, the file is not a
+ *   parseable X.509 certificate, or the registry write into the
+ *   sandbox user's hive fails.
+ */
+export function windowsTrustCa(caCertPath: string): void {
+  // 60s: first call may create the sandbox user's profile
+  // (LOGON_WITH_PROFILE) via the one-shot CreateProcessWithLogonW.
+  const r = runSrtWin(['user', 'trust-ca', caCertPath], undefined, 60_000)
+  logForDebugging(
+    `[Sandbox Windows] user trust-ca exit=${r.status}: ${r.stderr || r.stdout}`,
+  )
+  if (r.status !== 0) {
+    throw new Error(
+      `srt-win user trust-ca '${caCertPath}' failed (exit ` +
+        `${r.status}): ${r.stderr || r.stdout}`,
+    )
   }
 }
 
@@ -548,7 +647,7 @@ export function installWindowsSandbox(
   }
   if (opts.force) args.push('--force')
 
-  const r = runSrtWin(args)
+  const r = runSrtWin(args, undefined, 60_000)
   logForDebugging(
     `[Sandbox Windows] install exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -958,6 +1057,38 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   env: NodeJS.ProcessEnv
 } {
   const exe = getSrtWinPath()
+  // Generated proxy + CA-trust env. Single-sourced here so the
+  // same object feeds (a) the spawn env merge below and (b) the
+  // explicit `--env` overlay for the two-hop launch.
+  //
+  // Under `asSandboxUser` the CA-bundle path is OMITTED: it points
+  // into the broker's `%TEMP%\srt-sandbox-…`, which the
+  // `srt-sandbox` user cannot read — OpenSSL-backed clients (msys2
+  // curl, `git -c http.sslBackend=openssl`, node, python) would
+  // fail to open it (curl exit 77 etc.). Schannel-level trust comes
+  // from the registry write `srt-win user trust-ca` did at install
+  // time; the env-var bundle layer for the two-hop path lands with
+  // the working-tree/profile-grant work. See WindowsSandboxParams.
+  if (p.asSandboxUser && p.caCertPath !== undefined) {
+    logForDebugging(
+      `[Sandbox Windows] caCertPath '${p.caCertPath}' not forwarded ` +
+        `under asSandboxUser (broker %TEMP% is unreadable by ` +
+        `srt-sandbox); schannel trust via 'srt-win user trust-ca' ` +
+        `is the only CA-trust path for the two-hop launch`,
+    )
+  }
+  const generated = envListToObject(
+    generateProxyEnvVars(
+      p.httpProxyPort,
+      p.socksProxyPort,
+      p.asSandboxUser ? undefined : p.caCertPath,
+      p.proxyAuthToken,
+    ),
+  )
+  // TMPDIR is a POSIX path meant for the macOS/Linux FS sandbox — it
+  // serves no purpose on Windows and breaks msys2 tools (mktemp etc.).
+  delete generated.TMPDIR
+
   const argv: string[] = [exe, 'exec', ...groupRefArgs(p.group)]
   // Format-validated at the config boundary
   // (`WindowsConfigSchema.wfpSublayerGuid: z.string().uuid()`),
@@ -970,6 +1101,22 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   }
   for (const f of p.denyRead ?? []) argv.push('--deny-read', f)
   for (const f of p.denyWrite ?? []) argv.push('--deny-write', f)
+  if (p.asSandboxUser) {
+    argv.push('--as-sandbox-user')
+    // The two-hop runner starts with the SANDBOX user's profile env
+    // (USERPROFILE/TEMP isolated) and overlays exactly what we pass
+    // as `--env`. The broker does NOT enumerate its own env — the
+    // overlay is built here from the same single source as the
+    // same-user path's spawn env.
+    const overlay: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH,
+      PATHEXT: process.env.PATHEXT,
+      ...generated,
+    }
+    for (const [k, v] of Object.entries(overlay)) {
+      if (v !== undefined) argv.push('--env', `${k}=${v}`)
+    }
+  }
   argv.push('--')
 
   const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
@@ -1059,17 +1206,6 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
 
   // Generated proxy vars override any inherited (or just-masked)
   // ones so the child always routes through this sandbox's proxies.
-  const generated = envListToObject(
-    generateProxyEnvVars(
-      p.httpProxyPort,
-      p.socksProxyPort,
-      undefined,
-      p.proxyAuthToken,
-    ),
-  )
-  // TMPDIR is a POSIX path meant for the macOS/Linux FS sandbox — it
-  // serves no purpose on Windows and breaks msys2 tools (mktemp etc.).
-  delete generated.TMPDIR
   const env: NodeJS.ProcessEnv = { ...baseEnv, ...generated }
   return { argv, env }
 }

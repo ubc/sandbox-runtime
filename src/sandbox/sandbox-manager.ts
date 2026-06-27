@@ -13,7 +13,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, X509Certificate } from 'node:crypto'
 import type {
   CredentialsConfig,
   SandboxRuntimeConfig,
@@ -45,6 +45,8 @@ import {
   expandWindowsFsDenyPaths,
   stampWindowsAcl,
   restoreWindowsAcl,
+  getWindowsSandboxUserStatus,
+  getWindowsSandboxCaCert,
   WINDOWS_ACL_PATH_OK,
   WINDOWS_ACL_PARENT_OK,
   DEFAULT_WINDOWS_GROUP_NAME,
@@ -418,6 +420,60 @@ async function initialize(
   // partial — exit 2 means at least one input was skipped):
   // fail-closed at session start.
   if (getPlatform() === 'windows') {
+    // Separate-user opt-in: refuse early when the config asks for
+    // it but the account isn't provisioned. Doing this at
+    // initialize() (not wrap-time) means the host gets a single
+    // actionable error before any per-exec work happens, instead of
+    // exit-15 on every command.
+    if (runtimeConfig.windows?.asSandboxUser) {
+      const u = getWindowsSandboxUserStatus()
+      if (!u.provisioned || !u.credPresent) {
+        config = undefined
+        throw new Error(
+          `windows.asSandboxUser is set but the sandbox user is not ` +
+            `provisioned (user=${u.provisioned}, cred=${u.credPresent}). ` +
+            `Run \`npx sandbox-runtime windows-install\` (one UAC ` +
+            `prompt) to provision it.`,
+        )
+      }
+      // schannel-level trust under the sandbox user is install-time
+      // (cert lifecycle = sandbox-user lifecycle), not per-session.
+      // The env-var trust layer covers OpenSSL clients regardless,
+      // but System32 curl / IWR / .NET / default-backend git only
+      // trust what's in the sandbox user's `CurrentUser\Root` —
+      // which `srt-win exec` does not (and must not) write. Gate
+      // only on `asSandboxUser`: the same-user path lands on the
+      // REAL user's Root, which is out of scope (env-var trust
+      // only). Compare thumbprints so a stale install-time CA
+      // doesn't pass the gate while schannel rejects the session's
+      // proxy-minted leaves.
+      if (runtimeConfig.network.tlsTerminate && mitmCA) {
+        const installed = getWindowsSandboxCaCert(u)
+        const sessionThumb = new X509Certificate(mitmCA.certPem).fingerprint
+          .replace(/:/g, '')
+          .toUpperCase()
+        if (!installed) {
+          config = undefined
+          throw new Error(
+            `tlsTerminate with windows.asSandboxUser requires the ` +
+              `sandbox to be installed with this CA (thumb=` +
+              `${sessionThumb}): run \`srt-win user trust-ca ` +
+              `${mitmCA.certPath}\`. Per-exec installs into the ` +
+              `sandbox user's Root store are not supported.`,
+          )
+        }
+        if (installed.thumb !== sessionThumb) {
+          config = undefined
+          throw new Error(
+            `tlsTerminate with windows.asSandboxUser: the sandbox's ` +
+              `installed CA (thumb=${installed.thumb}) doesn't match ` +
+              `this session's CA (thumb=${sessionThumb}). Run ` +
+              `\`srt-win user trust-ca ${mitmCA.certPath}\` to ` +
+              `update it.`,
+          )
+        }
+      }
+    }
     try {
       const deny = computeWindowsFsDenySet(runtimeConfig)
       if (deny.denyRead.length > 0 || deny.denyWrite.length > 0) {
@@ -1339,6 +1395,11 @@ async function wrapWithSandboxArgv(
       holderPid: windowsFsStampedSet ? process.pid : undefined,
       denyRead: perExecDenyRead,
       denyWrite: perExecDenyWrite,
+      // Opt-in two-hop separate-user launch. Additive — defaults
+      // false, the same-user deny-only-group path is unchanged.
+      // Provisioning was checked at initialize().
+      asSandboxUser: config?.windows?.asSandboxUser ?? false,
+      caCertPath: mitmCA?.trustBundlePath,
       binShell: parseWindowsBinShell(binShell),
     })
   }

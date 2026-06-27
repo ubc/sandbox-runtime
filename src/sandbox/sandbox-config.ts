@@ -457,6 +457,16 @@ export const WindowsConfigSchema = z.object({
         'use the srt-win compile-time default. Set this when filters were ' +
         'installed by enterprise tooling under a custom sublayer.',
     ),
+  asSandboxUser: z
+    .boolean()
+    .default(false)
+    .describe(
+      'Run sandboxed commands as the dedicated `srt-sandbox` local user ' +
+        '(two-hop launch via CreateProcessWithLogonW) instead of the ' +
+        'same-user deny-only-group token. Requires `srt-win install` to ' +
+        'have provisioned the user. Opt-in while the separate-user path ' +
+        'stabilises; the same-user path is unchanged when false.',
+    ),
   proxyPortRange: z
     .tuple([z.number().int().min(1), z.number().int().max(65535)])
     .refine(([lo, hi]) => lo <= hi && hi - lo <= 64, {

@@ -50,6 +50,8 @@ export {
   getWindowsGroupStatus,
   getWindowsWfpStatus,
   getWindowsSandboxUserStatus,
+  getWindowsSandboxCaCert,
+  windowsTrustCa,
   installWindowsSandbox,
   uninstallWindowsSandbox,
   createWindowsGroup,
