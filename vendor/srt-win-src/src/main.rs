@@ -511,7 +511,7 @@ fn canonicalize_deny_targets(
     Vec<(String, String)>,
 )> {
     use anyhow::anyhow;
-    use srt_win::acl;
+    use srt_win::{acl, path_id};
     let mut targets = Vec::new();
     let mut bad_inputs = Vec::new();
     for (list, mask) in [
@@ -519,7 +519,7 @@ fn canonicalize_deny_targets(
         (deny_write, acl::AclMask::WriteDeny),
     ] {
         for p in list {
-            match acl::canonicalize_path(p) {
+            match path_id::canonicalize_path(p) {
                 Ok((canon, false)) => targets.push((canon, mask)),
                 Ok((canon, true)) => {
                     return Err(anyhow!(
@@ -528,13 +528,13 @@ fn canonicalize_deny_targets(
                          '{canon}')."
                     ));
                 }
-                Err(acl::CanonError::Glob) => {
+                Err(path_id::CanonError::Glob) => {
                     return Err(anyhow!(
                         "Windows fs deny requires explicit file \
                          paths; got glob '{p}'."
                     ));
                 }
-                Err(acl::CanonError::Other(e)) => {
+                Err(path_id::CanonError::Other(e)) => {
                     bad_inputs.push((p.clone(), format!("{e:#}")));
                 }
             }

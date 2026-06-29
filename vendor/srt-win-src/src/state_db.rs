@@ -62,6 +62,7 @@ use windows::Win32::System::Threading::{
 use crate::acl::{
     self, AclMask, CapturedSd, MarkerHash, PrebuiltDacls, StampClass,
 };
+use crate::path_id;
 use crate::util::{pcwstr, wstr};
 
 /// Holder PID — the LONG-LIVED process that owns a set of stamps
@@ -163,7 +164,7 @@ pub struct Snapshot {
     /// `None` ⇔ DB wiped while the file was stamped. Restore
     /// reports `original_sd_lost` and leaves the stamp.
     pub original_sd: Option<CapturedSd>,
-    pub file_id: acl::FileId,
+    pub file_id: path_id::FileId,
     pub(crate) parent_path: Option<String>,
 }
 
@@ -171,7 +172,7 @@ pub struct Snapshot {
 #[derive(Debug, Clone)]
 struct ParentStamp {
     original_sd: Option<CapturedSd>,
-    file_id: Option<acl::FileId>,
+    file_id: Option<path_id::FileId>,
 }
 
 /// Sealed proof that [`Locked::ensure_stamped`] read the live DACL
@@ -867,9 +868,9 @@ impl Locked {
         // 1. Disk first.
         let cur = acl::capture_sd(canon)
             .with_context(|| format!("capture SD for '{canon}'"))?;
-        let (cur_id, links) = acl::capture_id_and_links(canon)
+        let (cur_id, links) = path_id::capture_id_and_links(canon)
             .with_context(|| format!("capture file_id+links '{canon}'"))?;
-        let parent = acl::canonical_parent_of(canon);
+        let parent = path_id::canonical_parent_of(canon);
 
         // 2. Classify.
         let class = acl::classify_sd(&cur, &dacls.calib)
@@ -1082,7 +1083,7 @@ impl Locked {
         // stale row when we can't read the live DACL).
         let (cur, cur_id) = match (
             acl::capture_sd(parent),
-            acl::capture_file_id(parent),
+            path_id::capture_file_id(parent),
         ) {
             (Ok(sd), Ok(id)) => (sd, id),
             (e_sd, e_id) => {
@@ -1297,7 +1298,7 @@ impl Locked {
         &self,
         canon: &str,
         original_sd: Option<&CapturedSd>,
-        file_id: &acl::FileId,
+        file_id: &path_id::FileId,
         parent_path: Option<&str>,
     ) -> Result<()> {
         self.conn
@@ -1555,7 +1556,7 @@ fn snapshot_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
     Ok(Snapshot {
         canonical_path: r.get(0)?,
         original_sd: r.get::<_, Option<Vec<u8>>>(1)?.map(CapturedSd::from),
-        file_id: acl::FileId::from_bytes(&r.get::<_, Vec<u8>>(2)?)
+        file_id: path_id::FileId::from_bytes(&r.get::<_, Vec<u8>>(2)?)
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     2,
@@ -1774,7 +1775,7 @@ fn try_restore_snapshot(
         IdGate::Match => {}
         IdGate::Unreadable => return Ok(RestoreOutcome::LeftUnreadable),
         IdGate::Mismatch => {
-            return Ok(match acl::locate_by_file_id(&snap.file_id) {
+            return Ok(match path_id::locate_by_file_id(&snap.file_id) {
                 Some(at) => {
                     eprintln!(
                         "srt-win: '{}': file_id mismatch — protected \
@@ -1889,7 +1890,7 @@ impl RestoreVerdict {
 fn verify_and_restore(
     path: &str,
     original_sd: Option<&CapturedSd>,
-    file_id: acl::FileId,
+    file_id: path_id::FileId,
     kind: RestoreKind,
     calib: &acl::StampCalibration,
     force: bool,
@@ -2040,11 +2041,11 @@ enum IdGate {
 /// (ERROR_FILE/PATH_NOT_FOUND) or different inode → `Mismatch`;
 /// any other open error → `Unreadable` (retryable, not a
 /// mismatch).
-fn identity_gate(path: &str, expect: acl::FileId) -> IdGate {
+fn identity_gate(path: &str, expect: path_id::FileId) -> IdGate {
     use windows::Win32::Foundation::{
         ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND,
     };
-    match acl::capture_file_id(path) {
+    match path_id::capture_file_id(path) {
         Ok(cur) if cur == expect => IdGate::Match,
         Ok(_) => IdGate::Mismatch,
         Err(e) => {
@@ -2075,7 +2076,7 @@ fn parent_stamp_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ParentStamp>
         file_id: r
             .get::<_, Option<Vec<u8>>>(1)?
             .as_deref()
-            .map(acl::FileId::from_bytes)
+            .map(path_id::FileId::from_bytes)
             .transpose()
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -2397,7 +2398,7 @@ mod tests {
     fn snapshot_round_trip() {
         with_mem_db(|db| {
             db.register_broker().unwrap();
-            let id = acl::FileId { volume_serial: 0xdead, id128: [7u8; 16] };
+            let id = path_id::FileId { volume_serial: 0xdead, id128: [7u8; 16] };
             db.upsert_snapshot(
                 r"\\?\C:\f",
                 Some(&vec![1, 2, 3].into()),
@@ -2518,7 +2519,7 @@ mod tests {
     fn fence_fallback_filter() {
         with_mem_db(|db| {
             db.register_broker().unwrap();
-            let id = acl::FileId { volume_serial: 0, id128: [0; 16] };
+            let id = path_id::FileId { volume_serial: 0, id128: [0; 16] };
             for (p, failed) in [
                 (r"\\?\C:\d\ok", 0i64),
                 (r"\\?\C:\d\fail", 1),

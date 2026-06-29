@@ -21,6 +21,7 @@ pub mod self_protect;
 pub mod launch;
 
 pub mod acl;
+pub mod path_id;
 pub mod fence;
 pub mod state_db;
 
