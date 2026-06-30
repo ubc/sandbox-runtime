@@ -10,12 +10,37 @@ import * as readline from 'readline'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
+import { fileURLToPath } from 'url'
 
 /**
  * Get default config path
  */
 function getDefaultConfigPath(): string {
   return path.join(os.homedir(), '.srt-settings.json')
+}
+
+/**
+ * Read the package version from package.json at runtime.
+ *
+ * `process.env.npm_package_version` is only set when run via an npm script,
+ * not for a globally-installed `srt` binary — so relying on it makes
+ * `srt --version` indistinguishable between builds. Reading package.json
+ * directly (it sits one level above dist/cli.js, and above src/cli.ts when
+ * run from source) makes the version a reliable build identifier. The LTIC
+ * fork carries a distinctive `-ltic.N` suffix so users can confirm they are
+ * on the patched fork (allowAllDomains + denyReadAlways) rather than upstream.
+ */
+function getPackageVersion(): string {
+  try {
+    const pkgPath = path.join(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '..',
+      'package.json',
+    )
+    return JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version || '0.0.0'
+  } catch {
+    return process.env.npm_package_version || '0.0.0'
+  }
 }
 
 /**
@@ -44,7 +69,7 @@ async function main(): Promise<void> {
     .description(
       'Run commands in a sandbox with network and filesystem restrictions',
     )
-    .version(process.env.npm_package_version || '1.0.0')
+    .version(getPackageVersion())
 
   // ── Windows install/uninstall ─────────────────────────────────
   // Self-elevating one-shot install (one UAC prompt). Also
