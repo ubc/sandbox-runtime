@@ -44,6 +44,65 @@ function getPackageVersion(): string {
 }
 
 /**
+ * LTIC fork: stream sandbox violations to a file the sandboxed child can
+ * read.
+ *
+ * The violation store lives in this host-side process; the sandboxed agent
+ * only ever sees a generic 403 / EPERM when it trips a rule. Appending each
+ * violation line to a host-written file (advertised to the child via
+ * SRT_VIOLATIONS_FILE) lets tooling inside the sandbox — e.g. a Claude Code
+ * PostToolUse hook — surface denial reasons to the agent.
+ *
+ * The file lives under ~/.local/state/srt, which the sandbox config should
+ * grant read but NOT write: violation lines flow into an agent's context,
+ * so sandboxed code must not be able to forge them.
+ */
+function startViolationsFile(): string | undefined {
+  try {
+    const dir = path.join(os.homedir(), '.local', 'state', 'srt')
+    fs.mkdirSync(dir, { recursive: true })
+
+    // Prune logs from long-dead sessions so the directory doesn't grow
+    // without bound.
+    const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
+    for (const name of fs.readdirSync(dir)) {
+      if (!/^violations-\d+\.log$/.test(name)) continue
+      const p = path.join(dir, name)
+      try {
+        if (fs.statSync(p).mtimeMs < weekAgo) fs.unlinkSync(p)
+      } catch {
+        // Another session may have pruned it first.
+      }
+    }
+
+    const file = path.join(dir, `violations-${process.pid}.log`)
+    fs.writeFileSync(file, '')
+
+    const store = SandboxManager.getSandboxViolationStore()
+    // The store notifies synchronously on every addViolation, so each
+    // callback carries exactly the events past `seen`; the initial
+    // subscribe() replay is skipped because `seen` already covers it.
+    let seen = store.getTotalCount()
+    store.subscribe(() => {
+      const total = store.getTotalCount()
+      if (total <= seen) return
+      const fresh = store.getViolations().slice(-(total - seen))
+      seen = total
+      const text = fresh
+        .map(v => `${v.timestamp.toISOString()} ${v.line}`)
+        .join('\n')
+      fs.appendFile(file, text + '\n', () => {})
+    })
+    return file
+  } catch (error) {
+    logForDebugging(
+      `Failed to set up violations file: ${error instanceof Error ? error.message : String(error)}`,
+    )
+    return undefined
+  }
+}
+
+/**
  * Create a minimal default config if no config file exists
  */
 function getDefaultConfig(): SandboxRuntimeConfig {
@@ -232,9 +291,19 @@ async function main(): Promise<void> {
             }
           }
 
-          // Initialize sandbox with config
+          // Initialize sandbox with config. LTIC fork: enable the log
+          // monitor so filesystem (seatbelt/seccomp) denials reach the
+          // violation store — the CLI otherwise only collects proxy denials.
           logForDebugging('Initializing sandbox...')
-          await SandboxManager.initialize(runtimeConfig)
+          await SandboxManager.initialize(runtimeConfig, undefined, true)
+
+          // LTIC fork: expose violations to the sandboxed child (see
+          // startViolationsFile). The child inherits process.env.
+          const violationsFile = startViolationsFile()
+          if (violationsFile) {
+            process.env.SRT_VIOLATIONS_FILE = violationsFile
+            logForDebugging(`Violations file: ${violationsFile}`)
+          }
 
           // Set up control fd for dynamic config updates if specified
           let controlReader: readline.Interface | null = null
