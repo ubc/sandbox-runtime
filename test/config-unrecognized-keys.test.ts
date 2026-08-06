@@ -27,8 +27,9 @@ describe('collectUnrecognizedConfigKeys', () => {
       filesystem: {
         denyRead: ['/Users'],
         allowRead: ['~/src'],
-        // Fork key (upstream PR #284)
+        // Fork keys (upstream PR #284)
         denyReadAlways: ['/**/.env*', '/**/credentials'],
+        denyReadAlwaysExcept: ['/**/.env.example', '/**/id_*.pub'],
         allowWrite: ['/tmp'],
         denyWrite: [],
       },
