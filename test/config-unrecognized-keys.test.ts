@@ -26,10 +26,7 @@ describe('collectUnrecognizedConfigKeys', () => {
       },
       filesystem: {
         denyRead: ['/Users'],
-        allowRead: ['~/src'],
-        // Fork keys (upstream PR #284)
-        denyReadAlways: ['/**/.env*', '/**/credentials'],
-        denyReadAlwaysExcept: ['/**/.env.example', '/**/id_*.pub'],
+        allowRead: ['~/src', '/**/.env.example'],
         allowWrite: ['/tmp'],
         denyWrite: [],
       },
@@ -53,14 +50,33 @@ describe('collectUnrecognizedConfigKeys', () => {
     ])
   })
 
-  test('flags a mistyped fork key in filesystem', () => {
+  test('flags a mistyped key in filesystem', () => {
     const config = {
       ...base,
-      filesystem: { ...base.filesystem, denyReadAlway: ['/**/.env*'] },
+      filesystem: { ...base.filesystem, alowRead: ['~/src'] },
     }
 
     expect(collectUnrecognizedConfigKeys(config)).toEqual([
-      'filesystem.denyReadAlway',
+      'filesystem.alowRead',
+    ])
+  })
+
+  test('flags the retired denyReadAlways keys', () => {
+    // Retired in 0.0.77-ltic.1: upstream's denyRead now beats an enclosing
+    // allowRead, and a narrower allowRead carves exceptions back out. A
+    // leftover config must be told its keys no longer do anything.
+    const config = {
+      ...base,
+      filesystem: {
+        ...base.filesystem,
+        denyReadAlways: ['/**/.env*'],
+        denyReadAlwaysExcept: ['/**/.env.example'],
+      },
+    }
+
+    expect(collectUnrecognizedConfigKeys(config)).toEqual([
+      'filesystem.denyReadAlways',
+      'filesystem.denyReadAlwaysExcept',
     ])
   })
 
