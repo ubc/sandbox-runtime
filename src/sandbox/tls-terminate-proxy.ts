@@ -1201,11 +1201,7 @@ async function forwardUpstream(
   // reaches the violations store (and the agent) rather than only the 403
   // body, which AWS clients swallow into a bare "Forbidden".
   const denySigv4 = (reason: string) => {
-    target.onFilterRequestDeny?.(
-      req.method ?? 'GET',
-      `https://${authority}${path}`,
-      reason,
-    )
+    target.onFilterRequestDeny?.(req.method ?? 'GET', url, reason)
     respondDenied(res, reason)
   }
   if (sigv4Plan?.action === 'deny') {
@@ -1237,14 +1233,24 @@ async function forwardUpstream(
         bufferedBody = await collectBody(bodySource, maxSigv4BodyBytes)
       } catch (err) {
         if (err instanceof BodyTooLargeError) {
-          denySigv4(
-            `AWS SigV4 request uses a masked credential and signs a ` +
-              `literal body hash or content-length, so the proxy must buffer the body to ` +
-              `re-sign it, but the body exceeds the ` +
-              `${maxSigv4BodyBytes}-byte buffering limit; denied. Sign ` +
-              `the payload as UNSIGNED-PAYLOAD to stream it without ` +
+          // On the signed-content-length path the client already streams
+          // UNSIGNED-PAYLOAD, so the advice is a smaller body, not a
+          // different signing mode.
+          const why = signedLengthDropped
+            ? `signs content-length, which body substitution had to drop, ` +
+              `so the proxy must buffer the body to restore the length`
+            : `signs a literal body hash, so the proxy must buffer the body`
+          const advice = signedLengthDropped
+            ? `Send the body in smaller parts (for S3, a multipart part size ` +
+              `under the limit), or use an unmasked credential to have the ` +
+              `request forwarded untouched.`
+            : `Sign the payload as UNSIGNED-PAYLOAD to stream it without ` +
               `buffering, or use an unmasked credential to have the ` +
-              `request forwarded untouched.`,
+              `request forwarded untouched.`
+          denySigv4(
+            `AWS SigV4 request uses a masked credential and ${why} to ` +
+              `re-sign it, but the body exceeds the ` +
+              `${maxSigv4BodyBytes}-byte buffering limit; denied. ${advice}`,
           )
           // Drain (discarding) whatever the client is still sending so it
           // can read the 403 instead of seeing a reset mid-upload.
