@@ -1197,18 +1197,37 @@ async function forwardUpstream(
   // the headers as they actually go upstream (real access key id, real
   // session token). Same denial surface as filterRequest.
   let bufferedBody: Buffer | undefined
+  // A SigV4 denial is recorded like a filterRequest denial, so the reason
+  // reaches the violations store (and the agent) rather than only the 403
+  // body, which AWS clients swallow into a bare "Forbidden".
+  const denySigv4 = (reason: string) => {
+    target.onFilterRequestDeny?.(
+      req.method ?? 'GET',
+      `https://${authority}${path}`,
+      reason,
+    )
+    respondDenied(res, reason)
+  }
   if (sigv4Plan?.action === 'deny') {
-    respondDenied(res, sigv4Plan.reason)
+    denySigv4(sigv4Plan.reason)
     endDeniedRequest(req, res, body)
     return
   }
   if (sigv4Plan?.action === 'resign') {
     let payloadHash = sigv4Plan.payloadHash
-    if (payloadHash === undefined) {
-      // The client signed a literal body hash: buffer the body and
-      // recompute so the signature covers the bytes actually sent. Body
+    // Body substitution may have dropped content-length (a sentinel that is
+    // not length-matched re-frames the body as chunked). A client that
+    // signed content-length — the AWS CLI's high-level `s3` commands do,
+    // together with UNSIGNED-PAYLOAD — then leaves the signer no value to
+    // cover, so the body is buffered here too and the real length restored.
+    const signedLengthDropped =
+      sigv4Plan.signedHeaders.includes('content-length') &&
+      fwdHeaders['content-length'] === undefined
+    if (payloadHash === undefined || signedLengthDropped) {
+      // The client signed a literal body hash (or content-length): buffer
+      // the body so the signature covers the bytes actually sent. Body
       // substitution runs FIRST — the buffered bytes (and therefore the
-      // hash and signature) must be the substituted body, not the
+      // hash, length and signature) must be the substituted body, not the
       // sentinel-bearing one the client wrote.
       const bodySource = bodyTransform ? body.pipe(bodyTransform) : body
       if (bodyTransform) {
@@ -1218,10 +1237,9 @@ async function forwardUpstream(
         bufferedBody = await collectBody(bodySource, maxSigv4BodyBytes)
       } catch (err) {
         if (err instanceof BodyTooLargeError) {
-          respondDenied(
-            res,
+          denySigv4(
             `AWS SigV4 request uses a masked credential and signs a ` +
-              `literal body hash, so the proxy must buffer the body to ` +
+              `literal body hash or content-length, so the proxy must buffer the body to ` +
               `re-sign it, but the body exceeds the ` +
               `${maxSigv4BodyBytes}-byte buffering limit; denied. Sign ` +
               `the payload as UNSIGNED-PAYLOAD to stream it without ` +
@@ -1240,7 +1258,7 @@ async function forwardUpstream(
         res.destroy()
         return
       }
-      payloadHash = sha256Hex(bufferedBody)
+      if (payloadHash === undefined) payloadHash = sha256Hex(bufferedBody)
       // The body is fully buffered so its exact length is known — set the
       // header unconditionally. end(Buffer) only auto-computes a
       // content-length for methods that default to chunked encoding; on
@@ -1253,10 +1271,7 @@ async function forwardUpstream(
       // Fail closed on any signer error — a request the proxy claimed to
       // handle must not go upstream half-rewritten, and a client-crafted
       // header set must not become an unhandled rejection.
-      respondDenied(
-        res,
-        `AWS SigV4 re-signing failed: ${(err as Error).message}`,
-      )
+      denySigv4(`AWS SigV4 re-signing failed: ${(err as Error).message}`)
       endDeniedRequest(req, res, body)
       return
     }

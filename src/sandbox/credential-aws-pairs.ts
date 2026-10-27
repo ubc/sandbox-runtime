@@ -217,6 +217,8 @@ export type Sigv4Plan =
   | { action: 'deny'; reason: string }
   | {
       action: 'resign'
+      /** Lower-case names of the headers the client signed (host included). */
+      signedHeaders: readonly string[]
       /**
        * Payload hash to sign. `undefined` means the client signed a
        * literal body hash (or none): the caller must buffer the body,
@@ -346,6 +348,7 @@ export function createSigv4Planner(
     const contentSha = singleHeader(headers['x-amz-content-sha256'])
     return {
       action: 'resign',
+      signedHeaders,
       payloadHash:
         contentSha === UNSIGNED_PAYLOAD ? UNSIGNED_PAYLOAD : undefined,
       apply(fwdHeaders, hostHeader, payloadHash) {

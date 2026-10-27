@@ -919,3 +919,81 @@ describe('body substitution composes with SigV4 re-signing', () => {
     verifyUpstreamSignature(captured)
   }, 20000)
 })
+
+describe('signed content-length survives body substitution', () => {
+  // What the AWS CLI's high-level `s3` commands send (aws s3 cp / rm):
+  // UNSIGNED-PAYLOAD with content-length in the signed header set. The
+  // access key id and secret are shorter than their sentinels, so body
+  // substitution cannot keep the length and drops content-length; the
+  // proxy must then buffer the body and restore the real length before
+  // re-signing, or the signer has no value for a header the client signed
+  // (previously: 403 "signed header content-length is missing").
+  const stack = makeStack({ bodySubstitution: true, sessionToken: true })
+  const { state } = stack
+
+  beforeAll(stack.start)
+  afterAll(stack.stop)
+
+  for (const [method, body] of [
+    ['PUT', 'object bytes'],
+    ['DELETE', ''],
+  ] as const) {
+    test(`${method} with UNSIGNED-PAYLOAD and a signed content-length: length restored, re-signed`, async () => {
+      state.captured = undefined
+      const amzDate = '20260715T000000Z'
+      const hostHeader = `${DEST}:${state.upstreamPort}`
+      const headers: IncomingHttpHeaders = {
+        'content-length': String(body.length),
+        'x-amz-date': amzDate,
+        'x-amz-content-sha256': UNSIGNED_PAYLOAD,
+      }
+      const { authorization } = signSigv4({
+        method,
+        requestTarget: '/bucket/key',
+        headers,
+        hostHeader,
+        signedHeaders: [
+          'content-length',
+          'host',
+          'x-amz-date',
+          'x-amz-content-sha256',
+        ],
+        payloadHash: UNSIGNED_PAYLOAD,
+        amzDate,
+        scope: { date: '20260715', region: REGION, service: SERVICE },
+        accessKeyId: state.fakeAkid,
+        secretAccessKey: state.fakeSecret,
+      })
+      const r = await curlViaProxy(
+        state.proxyPort!,
+        `https://${DEST}:${state.upstreamPort}/bucket/key`,
+        {
+          method,
+          data: body,
+          headers: [
+            `Authorization: ${authorization}`,
+            `X-Amz-Date: ${amzDate}`,
+            `X-Amz-Content-Sha256: ${UNSIGNED_PAYLOAD}`,
+            `Content-Length: ${body.length}`,
+          ],
+        },
+      )
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      const captured = state.captured!
+      expect(captured.method).toBe(method)
+      expect(captured.body.toString()).toBe(body)
+      expect(singleHeader(captured.headers['content-length'])).toBe(
+        String(body.length),
+      )
+      expect(captured.headers['transfer-encoding']).toBeUndefined()
+      expect(singleHeader(captured.headers['x-amz-content-sha256'])).toBe(
+        UNSIGNED_PAYLOAD,
+      )
+      expect(singleHeader(captured.headers['x-amz-security-token'])).toBe(
+        REAL_TOKEN,
+      )
+      verifyUpstreamSignature(captured)
+    }, 20000)
+  }
+})
